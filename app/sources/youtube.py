@@ -5,9 +5,13 @@
 
 from __future__ import annotations
 
+import subprocess
+from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from app.config import require_ffmpeg
 from app.models import SourceTrack
 
 _YT_HOSTS = {"music.youtube.com", "www.youtube.com", "youtube.com", "m.youtube.com"}
@@ -133,3 +137,94 @@ def _probe_error_message(url: str, messages: list[str]) -> str:
     if messages:
         return f"無法取得任何曲目：{url!r}\n" + "\n".join(messages)
     return f"無法取得任何曲目，yt-dlp 未回傳原因：{url!r}"
+
+
+# --- 下載 ---------------------------------------------------------------
+
+# 兩條串流都取「來源最高品質、不重編碼」：
+#   m4a  = AAC 128kbps（itag 140），容器即目標格式，零後處理
+#   opus = Opus ~160kbps（itag 251），webm 容器，需 remux 成 .opus
+_FORMAT_M4A = "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]"
+_FORMAT_OPUS = "bestaudio[acodec=opus]/bestaudio[ext=webm]"
+
+
+class DownloadError(RuntimeError):
+    """下載或 remux 失敗。"""
+
+
+@dataclass(frozen=True, slots=True)
+class DownloadedStreams:
+    m4a: Path
+    opus: Path
+
+
+def _download_one(video_id: str, workdir: Path, fmt: str, stem: str, ydl_factory) -> None:
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "format": fmt,
+        "outtmpl": {"default": str(workdir / f"{stem}.%(ext)s")},
+        "noplaylist": True,
+        "retries": 5,
+        "fragment_retries": 5,
+    }
+    with ydl_factory(opts) as ydl:
+        ydl.download([f"https://music.youtube.com/watch?v={video_id}"])
+
+
+def _find_one(workdir: Path, stem: str, suffixes: tuple[str, ...]) -> Path | None:
+    for suffix in suffixes:
+        path = workdir / f"{stem}{suffix}"
+        if path.exists():
+            return path
+    return None
+
+
+def remux_to_opus(src: Path, dest: Path, *, ffmpeg: str, runner=subprocess.run) -> None:
+    """把 webm 容器裡的 Opus 串流原封搬進 .opus 容器。
+
+    `-c:a copy` 是硬性要求：這裡不做任何重編碼。
+    """
+    cmd = [
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(src),
+        "-vn",
+        "-c:a", "copy",
+        str(dest),
+    ]
+    result = runner(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise DownloadError(f"ffmpeg remux 失敗：{result.stderr}")
+
+
+def download_streams(
+    video_id: str,
+    workdir: Path,
+    *,
+    ydl_factory=_default_ydl_factory,
+    ffmpeg: str | None = None,
+    runner=subprocess.run,
+) -> DownloadedStreams:
+    """下載 m4a 與 opus 兩條串流到 workdir，回傳兩個檔案路徑。"""
+    workdir.mkdir(parents=True, exist_ok=True)
+    ffmpeg = ffmpeg or require_ffmpeg()
+
+    _download_one(video_id, workdir, _FORMAT_M4A, f"{video_id}.m4a_src", ydl_factory)
+    m4a = _find_one(workdir, f"{video_id}.m4a_src", (".m4a", ".mp4"))
+    if m4a is None:
+        raise DownloadError(f"{video_id}：取不到 m4a 串流")
+    if m4a.suffix != ".m4a":
+        m4a = m4a.rename(m4a.with_suffix(".m4a"))
+
+    _download_one(video_id, workdir, _FORMAT_OPUS, f"{video_id}.opus_src", ydl_factory)
+    webm = _find_one(workdir, f"{video_id}.opus_src", (".webm", ".opus", ".ogg"))
+    if webm is None:
+        raise DownloadError(f"{video_id}：取不到 opus 串流")
+    opus = workdir / f"{video_id}.opus"
+    if webm.suffix == ".opus":
+        webm.replace(opus)
+    else:
+        remux_to_opus(webm, opus, ffmpeg=ffmpeg, runner=runner)
+        webm.unlink(missing_ok=True)
+
+    return DownloadedStreams(m4a=m4a, opus=opus)
