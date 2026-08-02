@@ -41,7 +41,7 @@ def sanitize_component(name: str, *, max_len: int = 100) -> str:
     cleaned = cleaned.rstrip(". ")
     if not cleaned:
         return "_"
-    if cleaned.upper() in _RESERVED:
+    if cleaned.split(".", 1)[0].upper() in _RESERVED:
         return "_" + cleaned
     return cleaned
 
