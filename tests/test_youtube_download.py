@@ -96,3 +96,109 @@ def test_download_streams_raises_when_m4a_missing(tmp_path):
 
     with pytest.raises(DownloadError, match="m4a"):
         download_streams("abc123", tmp_path, ydl_factory=lambda o: _NoopYDL(), ffmpeg="ffmpeg")
+
+
+# --- Finding 1: m4a 輸出不該保留內部暫存 stem 的 "_src" 中綴 ------------------
+
+
+def test_download_streams_m4a_output_has_no_temp_infix(tmp_path):
+    def factory(opts):
+        fmt = opts["format"]
+        suffix = ".m4a" if "m4a" in fmt else ".webm"
+        return _FakeYDL(opts, suffix)
+
+    result = download_streams(
+        "abc123", tmp_path, ydl_factory=factory, ffmpeg="ffmpeg",
+        runner=lambda cmd, **kw: (Path(cmd[-1]).write_bytes(b"opus"), _FakeCompleted())[1],
+    )
+    assert result.m4a.name == "abc123.m4a"
+    assert "m4a_src" not in str(result.m4a)
+
+
+# --- Finding 2: 真正的 yt-dlp 例外要包成本模組的 DownloadError -----------------
+
+
+class _FakeNetworkError(Exception):
+    """代表 yt_dlp.utils.DownloadError 之類、與本模組同名但不同類別的例外。"""
+
+
+class _RaisingYDL:
+    def __init__(self, opts):
+        self._opts = opts
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def download(self, urls):
+        raise _FakeNetworkError("HTTP Error 403: Forbidden")
+
+
+def test_download_streams_wraps_underlying_download_exception(tmp_path):
+    def factory(opts):
+        return _RaisingYDL(opts)
+
+    with pytest.raises(DownloadError) as exc_info:
+        download_streams("abc123", tmp_path, ydl_factory=factory, ffmpeg="ffmpeg")
+
+    assert "abc123" in str(exc_info.value)
+    assert isinstance(exc_info.value.__cause__, _FakeNetworkError)
+
+
+# --- Finding 3: 失敗時清掉本次呼叫已建立的殘留檔案 -----------------------------
+
+
+def test_download_streams_cleans_up_partial_artifacts_on_remux_failure(tmp_path):
+    def factory(opts):
+        fmt = opts["format"]
+        suffix = ".m4a" if "m4a" in fmt else ".webm"
+        return _FakeYDL(opts, suffix)
+
+    def failing_runner(cmd, **kwargs):
+        return _FakeCompleted(returncode=1, stderr="boom")
+
+    with pytest.raises(DownloadError):
+        download_streams(
+            "abc123", tmp_path, ydl_factory=factory, ffmpeg="ffmpeg", runner=failing_runner,
+        )
+
+    assert list(tmp_path.iterdir()) == []
+
+
+# --- Minor：未覆蓋到的分支 ------------------------------------------------------
+
+
+def test_download_streams_accepts_mp4_fallback_for_m4a(tmp_path):
+    def factory(opts):
+        fmt = opts["format"]
+        suffix = ".mp4" if "m4a" in fmt else ".webm"
+        return _FakeYDL(opts, suffix)
+
+    result = download_streams(
+        "abc123", tmp_path, ydl_factory=factory, ffmpeg="ffmpeg",
+        runner=lambda cmd, **kw: (Path(cmd[-1]).write_bytes(b"opus"), _FakeCompleted())[1],
+    )
+    assert result.m4a.name == "abc123.m4a"
+    assert result.m4a.exists()
+
+
+def test_download_streams_accepts_opus_container_directly(tmp_path):
+    def factory(opts):
+        fmt = opts["format"]
+        suffix = ".m4a" if "m4a" in fmt else ".opus"
+        return _FakeYDL(opts, suffix)
+
+    calls = []
+
+    def runner(cmd, **kwargs):
+        calls.append(cmd)
+        return _FakeCompleted()
+
+    result = download_streams(
+        "abc123", tmp_path, ydl_factory=factory, ffmpeg="ffmpeg", runner=runner,
+    )
+    assert result.opus.exists()
+    assert result.opus.name == "abc123.opus"
+    assert calls == []  # 已經是 .opus 容器，不該呼叫 remux

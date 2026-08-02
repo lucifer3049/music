@@ -168,8 +168,13 @@ def _download_one(video_id: str, workdir: Path, fmt: str, stem: str, ydl_factory
         "retries": 5,
         "fragment_retries": 5,
     }
-    with ydl_factory(opts) as ydl:
-        ydl.download([f"https://music.youtube.com/watch?v={video_id}"])
+    try:
+        with ydl_factory(opts) as ydl:
+            ydl.download([f"https://music.youtube.com/watch?v={video_id}"])
+    except Exception as exc:
+        # yt_dlp.utils.DownloadError 與本模組的 DownloadError 同名但不同類別，
+        # 呼叫端 `from app.sources.youtube import DownloadError` 只會接到這一個。
+        raise DownloadError(f"{video_id}：下載失敗（{fmt}）") from exc
 
 
 def _find_one(workdir: Path, stem: str, suffixes: tuple[str, ...]) -> Path | None:
@@ -205,26 +210,41 @@ def download_streams(
     ffmpeg: str | None = None,
     runner=subprocess.run,
 ) -> DownloadedStreams:
-    """下載 m4a 與 opus 兩條串流到 workdir，回傳兩個檔案路徑。"""
+    """下載 m4a 與 opus 兩條串流到 workdir，回傳兩個檔案路徑。
+
+    失敗時（任一階段拋出例外）會清掉這次呼叫已經在 workdir 建立的檔案，
+    避免下次針對同一個 workdir 重試時，撞見上次留下的殘缺檔案。
+    """
     workdir.mkdir(parents=True, exist_ok=True)
     ffmpeg = ffmpeg or require_ffmpeg()
 
-    _download_one(video_id, workdir, _FORMAT_M4A, f"{video_id}.m4a_src", ydl_factory)
-    m4a = _find_one(workdir, f"{video_id}.m4a_src", (".m4a", ".mp4"))
-    if m4a is None:
-        raise DownloadError(f"{video_id}：取不到 m4a 串流")
-    if m4a.suffix != ".m4a":
-        m4a = m4a.rename(m4a.with_suffix(".m4a"))
+    created: list[Path] = []
+    try:
+        _download_one(video_id, workdir, _FORMAT_M4A, f"{video_id}.m4a_src", ydl_factory)
+        found_m4a = _find_one(workdir, f"{video_id}.m4a_src", (".m4a", ".mp4"))
+        if found_m4a is None:
+            raise DownloadError(f"{video_id}：取不到 m4a 串流")
+        created.append(found_m4a)
+        m4a = workdir / f"{video_id}.m4a"
+        found_m4a.rename(m4a)
+        created.append(m4a)
 
-    _download_one(video_id, workdir, _FORMAT_OPUS, f"{video_id}.opus_src", ydl_factory)
-    webm = _find_one(workdir, f"{video_id}.opus_src", (".webm", ".opus", ".ogg"))
-    if webm is None:
-        raise DownloadError(f"{video_id}：取不到 opus 串流")
-    opus = workdir / f"{video_id}.opus"
-    if webm.suffix == ".opus":
-        webm.replace(opus)
-    else:
-        remux_to_opus(webm, opus, ffmpeg=ffmpeg, runner=runner)
-        webm.unlink(missing_ok=True)
+        _download_one(video_id, workdir, _FORMAT_OPUS, f"{video_id}.opus_src", ydl_factory)
+        webm = _find_one(workdir, f"{video_id}.opus_src", (".webm", ".opus", ".ogg"))
+        if webm is None:
+            raise DownloadError(f"{video_id}：取不到 opus 串流")
+        created.append(webm)
+        opus = workdir / f"{video_id}.opus"
+        if webm.suffix == ".opus":
+            webm.replace(opus)
+            created.append(opus)
+        else:
+            remux_to_opus(webm, opus, ffmpeg=ffmpeg, runner=runner)
+            created.append(opus)
+            webm.unlink(missing_ok=True)
 
-    return DownloadedStreams(m4a=m4a, opus=opus)
+        return DownloadedStreams(m4a=m4a, opus=opus)
+    except Exception:
+        for path in created:
+            path.unlink(missing_ok=True)
+        raise
