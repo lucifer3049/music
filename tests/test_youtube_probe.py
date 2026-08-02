@@ -1,0 +1,125 @@
+import pytest
+
+from app.sources.youtube import (
+    UnsupportedUrlError,
+    UrlKind,
+    classify_url,
+    probe,
+    to_source_track,
+)
+
+
+@pytest.mark.parametrize(
+    "url,kind",
+    [
+        ("https://music.youtube.com/watch?v=abc123", UrlKind.SINGLE),
+        ("https://music.youtube.com/watch?v=abc123&list=OLAK5uy_x", UrlKind.SINGLE),
+        ("https://www.youtube.com/watch?v=abc123", UrlKind.SINGLE),
+        ("https://youtu.be/abc123", UrlKind.SINGLE),
+        ("https://music.youtube.com/playlist?list=OLAK5uy_abc", UrlKind.ALBUM),
+        ("https://music.youtube.com/playlist?list=PLabc123", UrlKind.PLAYLIST),
+        ("https://music.youtube.com/playlist?list=RDCLAK5uy_abc", UrlKind.PLAYLIST),
+    ],
+)
+def test_classify_url(url, kind):
+    assert classify_url(url) == kind
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.kkbox.com/tw/tc/song/abc",
+        "https://example.com/foo",
+        "not a url",
+        "",
+    ],
+)
+def test_classify_url_rejects_unsupported(url):
+    with pytest.raises(UnsupportedUrlError):
+        classify_url(url)
+
+
+def test_to_source_track_prefers_structured_fields():
+    entry = {
+        "id": "abc123",
+        "title": "【MV】指尖笑 - 人間驚鴻宴",
+        "duration": 207,
+        "artist": "指尖笑",
+        "track": "人間驚鴻宴",
+        "album": "人間驚鴻宴",
+        "release_year": 2026,
+    }
+    st = to_source_track(entry)
+    assert st.video_id == "abc123"
+    assert st.url == "https://music.youtube.com/watch?v=abc123"
+    assert st.track == "人間驚鴻宴"
+    assert st.artist == "指尖笑"
+    assert st.release_year == 2026
+
+
+def test_to_source_track_handles_missing_fields():
+    st = to_source_track({"id": "x", "title": "某標題"})
+    assert st.track is None
+    assert st.artist is None
+    assert st.duration is None
+    assert st.raw_title == "某標題"
+
+
+def test_to_source_track_joins_artists_list():
+    st = to_source_track({"id": "x", "title": "t", "artists": ["A", "B"]})
+    assert st.artist == "A, B"
+
+
+class _FakeYDL:
+    """模擬 yt_dlp.YoutubeDL 的 context manager 介面。"""
+
+    def __init__(self, info):
+        self._info = info
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def extract_info(self, url, download=False):
+        return self._info
+
+
+def test_probe_single_returns_one_track():
+    info = {"id": "abc", "title": "某歌", "duration": 100}
+    tracks = probe(
+        "https://music.youtube.com/watch?v=abc",
+        ydl_factory=lambda opts: _FakeYDL(info),
+    )
+    assert len(tracks) == 1
+    assert tracks[0].video_id == "abc"
+
+
+def test_probe_album_returns_all_entries_with_order():
+    info = {
+        "_type": "playlist",
+        "title": "某專輯",
+        "entries": [
+            {"id": "a", "title": "第一首", "duration": 100},
+            {"id": "b", "title": "第二首", "duration": 200},
+        ],
+    }
+    tracks = probe(
+        "https://music.youtube.com/playlist?list=OLAK5uy_x",
+        ydl_factory=lambda opts: _FakeYDL(info),
+    )
+    assert [t.video_id for t in tracks] == ["a", "b"]
+
+
+def test_probe_skips_none_entries():
+    """已下架曲目在 playlist 會是 None，不能讓整批爆掉。"""
+    info = {
+        "_type": "playlist",
+        "entries": [None, {"id": "b", "title": "還在的歌"}],
+    }
+    tracks = probe(
+        "https://music.youtube.com/playlist?list=OLAK5uy_x",
+        ydl_factory=lambda opts: _FakeYDL(info),
+    )
+    assert [t.video_id for t in tracks] == ["b"]
