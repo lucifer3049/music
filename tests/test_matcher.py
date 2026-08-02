@@ -99,9 +99,16 @@ def test_wrong_title_scores_low():
 
 
 def test_track_without_artist_recovers_artist_from_title():
+    """artist 缺值時要從標題還原演出者，而不是拿整串標題去比對演出者。
+
+    wrong_artist 刻意取用歌名本身：舊的 fallback 拿整串 raw_title 比對演出者，
+    會把歌名 token 誤判成演出者吻合，讓這個候選拿到滿分。
+    """
     source = _source(raw_title="指尖笑 - 人間驚鴻宴", track="人間驚鴻宴", artist=None)
     good = score_candidate(source, _meta())
-    wrong_artist = score_candidate(source, _meta(artists=("完全不同的人",), album_artist="完全不同的人"))
+    wrong_artist = score_candidate(
+        source, _meta(artists=("人間驚鴻宴",), album_artist="人間驚鴻宴")
+    )
     assert good >= HIGH_CONFIDENCE
     assert good > wrong_artist
 
