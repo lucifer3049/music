@@ -59,7 +59,11 @@ def _ratio(a: str, b: str) -> float:
 
 
 def _duration_score(a: int | None, b: int | None) -> float | None:
-    """時長吻合度。任一邊缺值回 None，代表這項不參與評分。"""
+    """時長吻合度。任一邊缺值回 None，代表這項不參與評分。
+
+    規格書只定義「±3 秒內滿分，線性衰減」，沒有規定衰減終點落在哪裡；
+    這裡選擇 30 秒歸零是實作選擇，不是規格書規定的值。
+    """
     if a is None or b is None:
         return None
     diff = abs(a - b)
@@ -73,14 +77,21 @@ def _duration_score(a: int | None, b: int | None) -> float | None:
 def score_candidate(source: SourceTrack, meta: TrackMeta) -> float:
     """加權分數，範圍 0.0–1.0。
 
-    權重：歌名 0.6、演出者 0.25、時長 0.15。
-    歌名需佔多數權重：若歌名權重 <= 0.5，即使歌名完全不同，只要演出者與時長都精準吻合，
-    (1 - 歌名權重) 仍可能達到甚至超過 0.5，讓「歌名對不上」的候選誤判為可疑匹配。
+    權重依規格書公式：0.5 × 歌名 + 0.3 × 演出者 + 0.2 × 時長。
+    這代表歌名完全不同、但演出者與時長都精準吻合時，加權和上限為 0.3 + 0.2 = 0.5——
+    這是此權重下加權和的固有上限，不是缺陷。真正有行為意義的判斷界線是
+    HIGH_CONFIDENCE（0.92），與這個上限有足夠差距，不會被誤判為可疑匹配。
     時長缺值時該項不計分，其餘權重按比例放大，避免無時長資料就永遠達不到門檻。
     """
     if source.track:
         title_guess = normalize_title(source.track)
-        artist_guess = normalize_title(source.artist) if source.artist else None
+        if source.artist:
+            artist_guess = normalize_title(source.artist)
+        else:
+            # yt-dlp 常給出「有 track、無 artist」的殘缺結構化欄位；
+            # 先用 raw_title 拆一次找回演出者，避免直接拿整段（含歌名字詞的）
+            # 髒標題去跟候選的演出者比對。
+            artist_guess, _ = split_title(source.raw_title)
     else:
         artist_guess, title_guess = split_title(source.raw_title)
 
@@ -93,10 +104,10 @@ def score_candidate(source: SourceTrack, meta: TrackMeta) -> float:
         # 沒拆出演出者時，用整串原始標題對演出者做寬鬆比對
         artist_score = _ratio(normalize_title(source.raw_title), candidate_artists)
 
-    weighted = [(title_score, 0.6), (artist_score, 0.25)]
+    weighted = [(title_score, 0.5), (artist_score, 0.3)]
     dur = _duration_score(source.duration, meta.duration)
     if dur is not None:
-        weighted.append((dur, 0.15))
+        weighted.append((dur, 0.2))
 
     total_weight = sum(w for _, w in weighted)
     return sum(s * w for s, w in weighted) / total_weight

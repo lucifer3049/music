@@ -89,7 +89,21 @@ def test_structured_fields_preferred_over_raw_title():
 
 
 def test_wrong_title_scores_low():
-    assert score_candidate(_source(), _meta(title="完全不同的歌")) < 0.5
+    """歌名全錯時分數必須遠低於自動通過門檻。
+
+    演出者與時長都吻合仍會拿到 0.5（0.3 + 0.2），這是加權和的固有上限，
+    不是缺陷 —— 真正有行為意義的界線是 HIGH_CONFIDENCE，離它很遠。
+    """
+    score = score_candidate(_source(), _meta(title="完全不同的歌"))
+    assert score < HIGH_CONFIDENCE - 0.3
+
+
+def test_track_without_artist_recovers_artist_from_title():
+    source = _source(raw_title="指尖笑 - 人間驚鴻宴", track="人間驚鴻宴", artist=None)
+    good = score_candidate(source, _meta())
+    wrong_artist = score_candidate(source, _meta(artists=("完全不同的人",), album_artist="完全不同的人"))
+    assert good >= HIGH_CONFIDENCE
+    assert good > wrong_artist
 
 
 def test_duration_mismatch_lowers_score():
