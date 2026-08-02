@@ -20,6 +20,10 @@ class UnsupportedUrlError(ValueError):
     """不是可處理的 YouTube / YouTube Music 網址。"""
 
 
+class ProbeError(RuntimeError):
+    """yt-dlp 無法取得這個網址的任何曲目（下架、私人、地區限制等）。"""
+
+
 class UrlKind(StrEnum):
     SINGLE = "single"
     ALBUM = "album"
@@ -81,23 +85,51 @@ def _default_ydl_factory(opts: dict):
     return yt_dlp.YoutubeDL(opts)
 
 
+class _CollectingLogger:
+    """接住 yt-dlp 的診斷訊息，讓抽取失敗時原因不會被 ignoreerrors 吞掉。"""
+
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    def debug(self, msg: str) -> None:
+        pass
+
+    def info(self, msg: str) -> None:
+        pass
+
+    def warning(self, msg: str) -> None:
+        self.messages.append(msg)
+
+    def error(self, msg: str) -> None:
+        self.messages.append(msg)
+
+
 def probe(url: str, *, ydl_factory=_default_ydl_factory) -> list[SourceTrack]:
     """只抽 metadata，不下載任何音訊。回傳順序即專輯／清單順序。"""
     classify_url(url)  # 先驗證，網址不合法就別浪費一次網路來回
+    logger = _CollectingLogger()
     opts = {
-        "quiet": True,
-        "no_warnings": True,
         "skip_download": True,
         "extract_flat": False,
         "ignoreerrors": True,
+        "logger": logger,
     }
     with ydl_factory(opts) as ydl:
         info = ydl.extract_info(url, download=False)
 
     if info is None:
-        return []
+        raise ProbeError(_probe_error_message(url, logger.messages))
     entries = info.get("entries")
     if entries is None:
         return [to_source_track(info)]
     # 下架或私人影片在 entries 裡會是 None，跳過而不是讓整批失敗
-    return [to_source_track(e) for e in entries if e and e.get("id")]
+    tracks = [to_source_track(e) for e in entries if e and e.get("id")]
+    if not tracks:
+        raise ProbeError(_probe_error_message(url, logger.messages))
+    return tracks
+
+
+def _probe_error_message(url: str, messages: list[str]) -> str:
+    if messages:
+        return f"無法取得任何曲目：{url!r}\n" + "\n".join(messages)
+    return f"無法取得任何曲目，yt-dlp 未回傳原因：{url!r}"

@@ -1,6 +1,7 @@
 import pytest
 
 from app.sources.youtube import (
+    ProbeError,
     UnsupportedUrlError,
     UrlKind,
     classify_url,
@@ -121,5 +122,56 @@ def test_probe_skips_none_entries():
     tracks = probe(
         "https://music.youtube.com/playlist?list=OLAK5uy_x",
         ydl_factory=lambda opts: _FakeYDL(info),
+    )
+    assert [t.video_id for t in tracks] == ["b"]
+
+
+def test_probe_raises_when_nothing_extracted():
+    """單曲整個抽不到時要帶著原因拋出，而不是靜靜回空清單。"""
+    class _DeadYDL:
+        def __enter__(self):
+            return self
+        def __exit__(self, *exc):
+            return False
+        def extract_info(self, url, download=False):
+            return None
+
+    with pytest.raises(ProbeError):
+        probe("https://music.youtube.com/watch?v=gone", ydl_factory=lambda opts: _DeadYDL())
+
+
+def test_probe_error_carries_ytdlp_message():
+    """yt-dlp 報的原因要出現在例外訊息裡，Task 10 才有東西可存。"""
+    class _LoggingYDL:
+        def __init__(self, opts):
+            self._logger = opts.get("logger")
+        def __enter__(self):
+            return self
+        def __exit__(self, *exc):
+            return False
+        def extract_info(self, url, download=False):
+            if self._logger is not None:
+                self._logger.error("ERROR: Video unavailable. This video is private")
+            return None
+
+    with pytest.raises(ProbeError, match="private"):
+        probe("https://music.youtube.com/watch?v=gone", ydl_factory=_LoggingYDL)
+
+
+def test_probe_playlist_with_one_dead_entry_still_succeeds():
+    """清單裡壞掉一首不能拖垮整批 —— 這是規格明訂的行為。"""
+    info = {"_type": "playlist", "entries": [None, {"id": "b", "title": "還在的歌"}]}
+
+    class _PartialYDL:
+        def __enter__(self):
+            return self
+        def __exit__(self, *exc):
+            return False
+        def extract_info(self, url, download=False):
+            return info
+
+    tracks = probe(
+        "https://music.youtube.com/playlist?list=OLAK5uy_x",
+        ydl_factory=lambda opts: _PartialYDL(),
     )
     assert [t.video_id for t in tracks] == ["b"]
