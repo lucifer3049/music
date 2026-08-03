@@ -1,0 +1,83 @@
+# 音樂下載工具
+
+個人本機音樂收藏工具。從 YouTube Music 取得音訊，以 MusicBrainz 公開 metadata 補齊標籤與封面，依演出者／專輯結構落檔。
+
+本機單人使用的網頁 GUI，FastAPI 單一進程，無外部服務依賴。
+
+## 範圍與限制
+
+- 音訊唯一來源為 YouTube Music（透過 yt-dlp 取公開串流），用途限個人本機收藏。
+- **本工具不解密、不繞過任何 DRM**，不涉及任何訂閱制串流平台的音檔。
+- 原設計以 KKBOX 為 metadata 來源，實作時發現其專輯與歌曲頁已由 AWS WAF 攔截程式化存取（HTTP 202、`x-amzn-waf-action: challenge`、回應零位元組），繞過機器人驗證不在選項內，因此改用 **MusicBrainz** 公開 API，封面圖取自 **Cover Art Archive**。
+- YouTube Music 沒有無損來源。本工具**不重新編碼**，音訊串流原封落檔（m4a 走 remux 容器包裝、opus 走 `-c:a copy`），只是把來源給的東西存起來。
+- MusicBrainz 對冷門或非西方語系的發行版收錄不如串流平台完整；查無結果或候選不準時，靠下載前的人工確認畫面手動修正（見「使用流程」）。
+
+## 需求
+
+- Python 3.12 以上
+- ffmpeg 在 PATH 上（`winget install Gyan.FFmpeg`，安裝後需重開終端機）
+
+## 安裝
+
+    python -m venv .venv
+    .venv\Scripts\python.exe -m pip install -e ".[dev]"
+
+## 啟動
+
+    .venv\Scripts\python.exe -m uvicorn app.main:app --port 8765
+
+瀏覽器開 http://127.0.0.1:8765
+
+`app/main.py` 在 import 階段就會呼叫 `require_ffmpeg()`，所以 ffmpeg 必須先在 PATH 上，伺服器才啟動得起來（見「疑難排解」）。
+
+> repo 內另有 `.claude/launch.json` 與 `.claude/serve.ps1`，是開發用的啟動捷徑（`serve.ps1` 因含機器專屬的 ffmpeg 路徑而被 `.gitignore` 排除）。日常執行請用上面的 uvicorn 指令，不依賴這兩個檔案。
+
+## 設定
+
+| 環境變數 | 預設值 | 說明 |
+|---|---|---|
+| `MUSIC_ROOT` | `D:\Music` | m4a 輸出根目錄，供播放器／媒體伺服器掃描 |
+| `ARCHIVE_ROOT` | `D:\Archive` | opus 輸出根目錄，冷存不掃描 |
+| `MUSICBRAINZ_CONTACT` | 未設定時使用內建佔位字串 | MusicBrainz 規定 User-Agent 必須帶可辨識的聯絡方式，否則請求可能被拒。請設成自己的 email，不要留預設值 |
+
+`MUSIC_ROOT` / `ARCHIVE_ROOT` 由 `app/config.py` 的 `load_roots()` 讀取；`MUSICBRAINZ_CONTACT` 由 `app/sources/musicbrainz.py` 直接讀取環境變數，未設定時退回一句提示文字（不是空字串、也不是真實 email），MusicBrainz 有可能因此拒絕請求或降低優先度。
+
+## 輸出格式
+
+每首歌同時產出兩份，皆不重新編碼：
+
+| 位置 | 格式 | 用途 |
+|---|---|---|
+| `MUSIC_ROOT` | m4a（AAC，來源原始 bitrate，通常為 128kbps） | 日常播放。Windows 檔案總管、手機、車機原生讀標籤與封面 |
+| `ARCHIVE_ROOT` | opus（來源原始 bitrate） | 冷存。opus 是 YouTube 提供的較高品質串流，實際 bitrate 依影片而異（並非固定值），但檔案總管不顯示其標籤 |
+
+路徑結構為 `<根目錄>/<專輯演出者>/<專輯>/<曲序 曲名>.<副檔名>`（`app/storage/layout.py`），檔名會做 Windows 非法字元／保留裝置名淨化。封面圖只寫一份 `cover.jpg` 到 `MUSIC_ROOT` 的專輯資料夾內；opus 檔案本身也內嵌封面（Vorbis comment `METADATA_BLOCK_PICTURE`），m4a 內嵌於 `covr` atom。
+
+## 使用流程
+
+1. 貼上網址（支援單曲、專輯、播放清單，一行一個）
+2. 系統探測曲目並向 MusicBrainz 查詢候選標籤，停在「待確認」
+3. 逐首確認或修改標籤後按「確認並下載」（或「跳過」）
+4. 下載、寫標籤、落檔
+
+已下載完成（`done`）過的 videoId 再次送出會自動標記為「已跳過」；失敗（`failed`）或其他未完成狀態的曲目不算重複，可以重新處理。
+
+若整個網址探測失敗（下架、私人、地區限制、網址格式不支援等），job 本身會帶著錯誤訊息、不含任何曲目，畫面上直接顯示這則錯誤，不會誤判成「還在跑」。
+
+確認或跳過一首已經不在「待確認」狀態的曲目（例如已經確認過、正在下載、或已完成）會收到 409，畫面上會就地顯示錯誤——通常是重複點擊或分頁沒刷新，重新整理頁面即可。
+
+## 測試
+
+    .venv\Scripts\python.exe -m pytest -q
+
+目前共 166 個測試，全部使用 fixture 與 mock，不對 MusicBrainz 或 YouTube 發出任何真實請求。
+
+## 疑難排解
+
+| 症狀 | 原因與處理 |
+|---|---|
+| 啟動就報 ffmpeg 錯誤（`FfmpegMissingError`） | ffmpeg 不在 PATH。`app/main.py` 在 import 階段就檢查，裝好後需重開終端機讓 PATH 生效 |
+| 候選標籤明顯配錯，或全部很低分 | MusicBrainz 查無結果時會降級用 YouTube 自身資料（分數 0），仍可下載；未設定 `MUSICBRAINZ_CONTACT` 也可能讓請求被拒而觸發降級。冷門或非西方語系的發行版本來就收錄較薄，這正是「待確認」畫面存在的目的——手動改標籤即可 |
+| `Archive/` 底下的 opus 檔案，檔案總管內容面板看不到任何標籤 | 預期行為，不是 bug。Windows 檔案總管不讀 Opus 標籤。改用 foobar2000、MusicBee 或 VLC 檢視；`Music/` 底下的 m4a 檔案沒有這個問題 |
+| 曲目狀態卡在「failed」 | 展開錯誤訊息。常見於影片下架或地區限制而無法下載，其餘情況可重新送出同一個網址重試 |
+| 點「確認並下載」或「跳過」沒反應、出現錯誤 | 後端回 409，代表這首曲目已經不在「待確認」狀態（可能已被確認、正在下載或已完成）。重新整理頁面確認目前狀態 |
