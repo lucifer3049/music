@@ -6,6 +6,17 @@ const HIGH_CONFIDENCE = 0.92;
 const TERMINAL_STATUSES = new Set(["done", "failed", "skipped"]);
 const BLANK_COVER = "data:image/gif;base64,R0lGODlhAQABAAAAACw=";
 
+// 與後端 app/api/routes.py job_events() 結束串流的條件一致：job 層級探測
+// 失敗，或曲目非空且全部到達終結狀態。兩處各自判斷「這個 job 還要不要繼續
+// 追蹤」，條件對不齊的話其中一處就會在另一處已經放棄時繼續等待，或反過來
+// 提早放棄一個其實還在跑的 job。
+function isJobFinished(job) {
+  return (
+    job.error !== null ||
+    (job.tracks.length > 0 && job.tracks.every((t) => TERMINAL_STATUSES.has(t.status)))
+  );
+}
+
 const jobsEl = document.getElementById("jobs");
 const submitBtn = document.getElementById("submit");
 const urlsEl = document.getElementById("urls");
@@ -76,10 +87,7 @@ function renderJob(job) {
   const container = section.querySelector(".tracks");
   container.replaceChildren(...job.tracks.map(renderTrack));
 
-  const finished =
-    job.error !== null ||
-    (job.tracks.length > 0 && job.tracks.every((t) => TERMINAL_STATUSES.has(t.status)));
-  if (finished) {
+  if (isJobFinished(job)) {
     // 後端 SSE 端點在這個條件下也會結束串流；這裡同步把追蹤表清掉，
     // 避免留著一個實際上已經關閉（或即將關閉）的 EventSource 參照。
     openStreams.get(job.id)?.close();
@@ -111,9 +119,9 @@ function renderTrack(track) {
   confirmBtn.disabled = !editable || track.candidates.length === 0;
   skipBtn.disabled = !editable;
   confirmBtn.addEventListener("click", () =>
-    confirmTrack(article, track, selections.get(track.id) ?? 0)
+    confirmTrack(confirmBtn, track, selections.get(track.id) ?? 0)
   );
-  skipBtn.addEventListener("click", () => skipTrack(article, track.id));
+  skipBtn.addEventListener("click", () => skipTrack(skipBtn, track.id));
 
   return node;
 }
@@ -167,38 +175,59 @@ function renderCandidate(trackId, candidate, index, isSelected) {
   return div;
 }
 
-async function confirmTrack(article, track, index) {
+function confirmTrack(button, track, index) {
   const meta = track.candidates[index]?.meta;
-  if (!meta) return;
-  const actionErrorEl = article.querySelector(".action-error");
-  actionErrorEl.textContent = "";
-  try {
-    const response = await fetch(`/api/tracks/${track.id}/confirm`, {
+  if (!meta) return Promise.resolve();
+  return postAction(
+    button,
+    track.id,
+    `/api/tracks/${track.id}/confirm`,
+    {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ meta }),
-    });
+    }
+  );
+}
+
+function skipTrack(button, trackId) {
+  return postAction(button, trackId, `/api/tracks/${trackId}/skip`, { method: "POST" });
+}
+
+// confirmTrack/skipTrack 共用的請求邏輯。
+//
+// SSE 每秒推一次 payload、完全不做內容比對（見 app/api/routes.py
+// job_events()），renderJob() 收到就整包 replaceChildren()，把所有曲目
+// DOM 節點連根換掉。若在使用者點擊與這個 fetch resolve 之間剛好有一次
+// 重繪，呼叫當下捕捉到的 .action-error 節點就已經被丟棄、不在文件裡了：
+// 寫進去的錯誤訊息使用者永遠看不到。409（最常見的失敗）恰好又是最容易
+// 撞上重繪的情況——「操作失敗」多半意味著別的地方剛好也改了這條曲目的
+// 狀態，而那也正是會觸發重繪的事件。因此這裡不跨 await 保留 DOM 參照，
+// 只記住 track id，在要寫入的當下才重新查詢還活著的節點；查不到就代表
+// 這條曲目已經不在畫面上了，直接放棄寫入。
+async function postAction(button, trackId, url, options) {
+  const liveErrorEl = () =>
+    document.querySelector(`[data-track-id="${trackId}"] .action-error`);
+
+  const initialErrorEl = liveErrorEl();
+  if (initialErrorEl) initialErrorEl.textContent = "";
+
+  button.disabled = true;
+  try {
+    const response = await fetch(url, options);
     // 曲目可能在使用者按下按鈕的當下已經不再是 awaiting_confirm 了
     // （例如另一個分頁已經確認過、或已經被跳過）：後端這時回 409，
     // 若前端不理會狀態碼，使用者會以為確認送出去了，實際上什麼都沒發生。
     if (!response.ok) {
-      actionErrorEl.textContent = await extractErrorMessage(response);
+      const message = await extractErrorMessage(response);
+      const el = liveErrorEl();
+      if (el) el.textContent = message;
     }
   } catch (err) {
-    actionErrorEl.textContent = `連線失敗：${err.message}`;
-  }
-}
-
-async function skipTrack(article, trackId) {
-  const actionErrorEl = article.querySelector(".action-error");
-  actionErrorEl.textContent = "";
-  try {
-    const response = await fetch(`/api/tracks/${trackId}/skip`, { method: "POST" });
-    if (!response.ok) {
-      actionErrorEl.textContent = await extractErrorMessage(response);
-    }
-  } catch (err) {
-    actionErrorEl.textContent = `連線失敗：${err.message}`;
+    const el = liveErrorEl();
+    if (el) el.textContent = `連線失敗：${err.message}`;
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -238,10 +267,7 @@ fetch("/api/jobs")
   .then(({ jobs }) => {
     jobs.forEach((job) => {
       renderJob(job);
-      const active =
-        job.error === null &&
-        job.tracks.some((t) => !TERMINAL_STATUSES.has(t.status));
-      if (active) watchJob(job.id);
+      if (!isJobFinished(job)) watchJob(job.id);
     });
   })
   .catch(() => {});
