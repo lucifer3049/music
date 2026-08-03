@@ -1,0 +1,183 @@
+"""HTTP 端點。只做驗證與回應塑形，業務邏輯全在 Pipeline。"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+
+from app.jobs.store import JobRow, TrackRow, TrackStatus
+from app.models import TrackMeta
+from app.pipeline import Pipeline
+
+TERMINAL_STATUSES = {TrackStatus.DONE, TrackStatus.FAILED, TrackStatus.SKIPPED}
+SSE_INTERVAL_SECONDS = 1.0
+
+logger = logging.getLogger(__name__)
+
+
+class SubmitRequest(BaseModel):
+    urls: list[str] = Field(min_length=1)
+
+
+class MetaPayload(BaseModel):
+    title: str
+    artists: list[str]
+    album_artist: str
+    album: str
+    year: int | None = None
+    track_no: int | None = None
+    track_total: int | None = None
+    genre: str | None = None
+    cover_url: str | None = None
+    duration: int | None = None
+    source_url: str | None = None
+
+    def to_meta(self) -> TrackMeta:
+        return TrackMeta(
+            title=self.title,
+            artists=tuple(self.artists),
+            album_artist=self.album_artist,
+            album=self.album,
+            year=self.year,
+            track_no=self.track_no,
+            track_total=self.track_total,
+            genre=self.genre,
+            cover_url=self.cover_url,
+            duration=self.duration,
+            source_url=self.source_url,
+        )
+
+
+class ConfirmRequest(BaseModel):
+    meta: MetaPayload
+
+
+def _meta_dict(meta: TrackMeta) -> dict:
+    return {
+        "title": meta.title,
+        "artists": list(meta.artists),
+        "album_artist": meta.album_artist,
+        "album": meta.album,
+        "year": meta.year,
+        "track_no": meta.track_no,
+        "track_total": meta.track_total,
+        "genre": meta.genre,
+        "cover_url": meta.cover_url,
+        "duration": meta.duration,
+        "source_url": meta.source_url,
+    }
+
+
+def _track_dict(track: TrackRow) -> dict:
+    return {
+        "id": track.id,
+        "video_id": track.video_id,
+        "raw_title": track.source.raw_title,
+        "youtube_url": track.source.url,
+        "duration": track.source.duration,
+        "status": track.status.value,
+        "error": track.error,
+        "candidates": [
+            {"score": round(c.score, 4), "meta": _meta_dict(c.meta)} for c in track.candidates
+        ],
+        "chosen": _meta_dict(track.chosen) if track.chosen else None,
+    }
+
+
+def _job_dict(job: JobRow) -> dict:
+    return {
+        "id": job.id,
+        "url": job.url,
+        "created_at": job.created_at,
+        "error": job.error,
+        "tracks": [_track_dict(t) for t in job.tracks],
+    }
+
+
+def create_app(pipeline: Pipeline) -> FastAPI:
+    app = FastAPI(title="音樂下載工具")
+
+    # finalize() 在背景執行緒跑；asyncio.create_task() 回傳的 Task 只被事件迴圈
+    # 弱參照住，若不另外保留強參照，Task 有可能在下載跑到一半時被 GC 回收、
+    # 下載無聲消失（見任務說明）。這裡用 app.state 上的集合強參照住所有進行中的
+    # 背景工作，任務完成後才在 done_callback 裡移除。
+    background_tasks: set[asyncio.Task] = set()
+    app.state.background_tasks = background_tasks
+
+    def _on_finalize_done(task: asyncio.Task) -> None:
+        background_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            # Pipeline.finalize() 已經把預期內的失敗都轉成 track 的 FAILED 狀態，
+            # 理論上不該再拋例外到這裡；一旦真的發生（例如 store 本身壞掉），
+            # 絕不能無聲吞掉——至少要留下記錄，不然使用者只會看到曲目卡住不動、
+            # 卻查無原因。
+            logger.error("背景下載工作發生未預期例外", exc_info=exc)
+
+    @app.post("/api/jobs")
+    async def submit_jobs(request: SubmitRequest) -> dict:
+        # submit 會打網路，丟到 thread 避免卡住事件迴圈
+        job_ids = [
+            await asyncio.to_thread(pipeline.submit, url) for url in request.urls
+        ]
+        return {"job_ids": job_ids}
+
+    @app.get("/api/jobs")
+    async def list_jobs() -> dict:
+        return {"jobs": [_job_dict(j) for j in pipeline.store.list_jobs()]}
+
+    @app.get("/api/jobs/{job_id}")
+    async def get_job(job_id: int) -> dict:
+        job = pipeline.store.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="找不到任務")
+        return _job_dict(job)
+
+    @app.post("/api/tracks/{track_id}/confirm")
+    async def confirm_track(track_id: int, request: ConfirmRequest) -> dict:
+        if pipeline.store.get_track(track_id) is None:
+            raise HTTPException(status_code=404, detail="找不到曲目")
+        pipeline.store.confirm(track_id, request.meta.to_meta())
+        # 下載在背景跑，立刻回應讓前端可以繼續確認下一首。
+        task = asyncio.create_task(asyncio.to_thread(pipeline.finalize, track_id))
+        background_tasks.add(task)
+        task.add_done_callback(_on_finalize_done)
+        return {"status": TrackStatus.DOWNLOADING.value}
+
+    @app.post("/api/tracks/{track_id}/skip")
+    async def skip_track(track_id: int) -> dict:
+        if pipeline.store.get_track(track_id) is None:
+            raise HTTPException(status_code=404, detail="找不到曲目")
+        pipeline.store.set_status(track_id, TrackStatus.SKIPPED)
+        return {"status": TrackStatus.SKIPPED.value}
+
+    @app.get("/api/jobs/{job_id}/events")
+    async def job_events(job_id: int) -> StreamingResponse:
+        if pipeline.store.get_job(job_id) is None:
+            raise HTTPException(status_code=404, detail="找不到任務")
+
+        async def stream():
+            while True:
+                job = pipeline.store.get_job(job_id)
+                if job is None:
+                    break
+                payload = json.dumps(_job_dict(job), ensure_ascii=False)
+                yield f"data: {payload}\n\n"
+                # all() 對空陣列回傳 True：job 層級探測失敗時 job.tracks 是空
+                # 陣列（見 app/pipeline.py），這種 job 不會再有新曲目加入，必須
+                # 在第一輪就結束串流，否則會無窮迴圈卡住（原簡報參考碼多了
+                # `job.tracks and` 這個 guard，反而讓空陣列的情況永遠不會終止）。
+                if all(t.status in TERMINAL_STATUSES for t in job.tracks):
+                    break
+                await asyncio.sleep(SSE_INTERVAL_SECONDS)
+
+        return StreamingResponse(stream(), media_type="text/event-stream")
+
+    return app
