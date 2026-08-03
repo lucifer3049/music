@@ -7,13 +7,14 @@
 
 個人本機音樂收藏工具。輸入 YouTube Music 網址，下載音訊，自動寫入完整 metadata（標題、參與演出者、專輯演出者、專輯、年份、曲序、類型、封面），依演出者／專輯結構落檔。
 
-metadata 主要由 KKBOX 公開頁面補齊，因為 YouTube Music 自身標籤品質不穩。
+metadata 主要由 MusicBrainz 公開 API 補齊，因為 YouTube Music 自身標籤品質不穩。封面圖取自 Cover Art Archive。
 
 ### 法律與技術邊界
 
-- **KKBOX 音檔為 DRM 加密，本工具不解密、不繞過。** KKBOX 在本設計中僅作為公開 metadata 來源。
+- **不解密、不繞過任何 DRM。** 本工具不涉及訂閱制串流平台的音檔。
+- 原設計以 KKBOX 為 metadata 來源，實作時發現其專輯與歌曲頁已由 AWS WAF 攔截程式化存取（HTTP 202、`x-amzn-waf-action: challenge`、回應零位元組）。繞過機器人驗證不在選項內，故改用 MusicBrainz。
 - 音訊唯一來源為 YouTube Music，透過 yt-dlp 取公開串流，用途限個人本機收藏。
-- 爬取 KKBOX 頁面需加請求間隔與結果快取。
+- MusicBrainz 匿名存取速率上限為每秒 1 次請求，且要求 User-Agent 帶應用名稱與聯絡方式，否則會被拒絕。兩者皆為硬性規定。
 
 ### 品質前提
 
@@ -23,7 +24,7 @@ YouTube Music **沒有無損來源**。最高為 Opus ~160kbps（itag 251）或 
 
 | 決策 | 選擇 | 理由 |
 |---|---|---|
-| KKBOX 角色 | metadata 來源 | 音檔 DRM，不碰 |
+| metadata 來源 | MusicBrainz + Cover Art Archive | 官方公開 API，專為程式化存取設計；KKBOX 已封鎖爬取 |
 | 使用介面 | 本機網頁 GUI | 貼網址、看進度、下載前改標籤 |
 | 格式策略 | 保留原始串流，不重編碼 | 有損來源轉檔無益 |
 | 抽取串流 | m4a 與 opus 兩條都抓 | m4a 相容 Windows 檔案總管與車機；opus bitrate 較高供冷存 |
@@ -42,7 +43,7 @@ FastAPI 單進程，無外部服務依賴。業務邏輯集中於 service 層，
 ```
 app/
   sources/youtube.py    yt-dlp 包裝：網址分類、抽 metadata、抽串流
-  sources/kkbox.py      KKBOX 公開頁解析（selector 集中管理）
+  sources/musicbrainz.py  MusicBrainz 查詢與 JSON 對映（欄位路徑集中管理）
   matching/matcher.py   純函式：標題正規化 + 候選評分（無 IO）
   tagging/writer.py     mutagen：MP4Writer / OpusWriter 共用介面
   storage/layout.py     路徑生成、Windows 檔名淨化
@@ -67,7 +68,7 @@ app/
   → 分類（單曲 / 專輯 / 播放清單 / 多行批次）
   → 建立 job(s)，狀態 pending
   → yt-dlp 只抽 metadata，不下載
-  → KKBOX 搜尋並比對，產生候選
+  → MusicBrainz 搜尋並比對，產生候選
   → 狀態 awaiting_confirm，暫停
   → 使用者於 GUI 確認或手動修改
   → 下載 m4a 與 opus 兩條串流
@@ -97,7 +98,7 @@ app/
 - 全形半形統一
 - 大小寫收斂
 
-評分（KKBOX 搜尋結果取 top 3 候選）：
+評分（MusicBrainz 搜尋結果取 top 3 候選）：
 
 ```
 score = 0.5 × 歌名相似度（RapidFuzz token_set_ratio）
@@ -147,17 +148,17 @@ D:\Archive\<演出者>\<專輯>\01 <歌名>.opus
 | 情境 | 處理 |
 |---|---|
 | 影片下架、地區限制 | job 標 `failed` 並存錯誤訊息，可重試，不中斷整批 |
-| KKBOX 查無結果 | 降級使用 YouTube 自身 metadata，標記「未配對」旗標供事後補齊 |
-| KKBOX 改版致解析失敗 | selector 集中管理，整批降級但下載照常進行 |
+| MusicBrainz 查無結果 | 降級使用 YouTube 自身 metadata，標記「未配對」旗標供事後補齊 |
+| MusicBrainz 回應格式變動 | JSON 欄位路徑集中管理，整批降級但下載照常進行 |
 | 重複下載 | 以 videoId 為唯一鍵，已存在則跳過，可強制覆寫 |
 | ffmpeg 缺失 | 啟動時檢查並直接報錯，不等下載中途失敗 |
 | 網路中斷 | yt-dlp 內建重試；job 狀態存 SQLite，重啟可續 |
-| KKBOX 請求頻率 | 加請求間隔，同專輯結果快取 |
+| MusicBrainz 請求頻率 | 每次請求間隔至少 1 秒，同專輯結果快取 |
 
 ## 9. 測試策略
 
 - `matcher`：以真實髒標題語料做 table test（含 `【MV】`、`(Official Audio)`、`feat.` 等變體）
-- `kkbox`：儲存 HTML fixture 離線測試，**測試絕不對真實站台發出請求**
+- `musicbrainz`：儲存 JSON fixture 離線測試，**測試絕不對真實站台發出請求**
 - `tagging`：產生小檔寫入後以 mutagen 讀回驗證，涵蓋中文與 emoji 字串
 - `layout`：Windows 非法字元與保留字 table test
 - yt-dlp 一律 mock，不觸網路

@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 建立本機網頁工具，輸入 YouTube Music 網址即下載音訊、以 KKBOX 公開 metadata 補齊標籤與封面，並依演出者／專輯結構落檔。
+**Goal:** 建立本機網頁工具，輸入 YouTube Music 網址即下載音訊、以 MusicBrainz 公開 metadata 補齊標籤與封面，並依演出者／專輯結構落檔。
 
 **Architecture:** FastAPI 單進程，無外部服務。業務邏輯集中於 service 層（sources / matching / tagging / storage / jobs），路由僅做驗證與回應塑形。純函式模組（matcher、layout）與 IO 模組（sources）嚴格分離。任務狀態存 SQLite，背景下載跑在 thread pool，進度以 SSE 推播。
 
@@ -11,9 +11,9 @@
 ## Global Constraints
 
 - Python 3.12.4，全部依賴裝在專案內 venv：`D:\專案練習\音樂下載\.venv`
-- **不解密、不繞過 DRM。** KKBOX 僅作為公開 metadata 來源，音訊唯一來源為 YouTube Music。
+- **不解密、不繞過 DRM。** metadata 來自 MusicBrainz 公開 API，封面來自 Cover Art Archive，音訊唯一來源為 YouTube Music。
 - **下載路徑不重編碼音訊。** m4a 直接取容器輸出；opus 只做 `ffmpeg -c:a copy` remux。在 `app/sources/youtube.py` 的下載與 remux 流程中出現 `-b:a` 或 `-q:a` 一律是實作錯誤。（此約束只管下載路徑；`tests/conftest.py` 為了合成測試素材而編碼音訊不受此限。）
-- **測試絕不對 KKBOX 或 YouTube 發出真實請求。** 一律用 HTML fixture 與 mock。唯一例外是 Task 6 Step 1 的一次性 fixture 擷取，該步驟手動執行且結果存檔。
+- **測試絕不對 MusicBrainz 或 YouTube 發出真實請求。** 一律用 JSON fixture 與 mock。例外只有兩處手動執行的一次性步驟：Task 6 Step 5 的下載實測，與 Task 7 Step 1 的 fixture 擷取。
 - 專案根目錄 `D:\專案練習\音樂下載`，套件根 `app/`，測試根 `tests/`
 - 預設輸出根：`D:\Music`（m4a）與 `D:\Archive`（opus），可用環境變數 `MUSIC_ROOT`、`ARCHIVE_ROOT` 覆寫
 - 高信心門檻常數 `HIGH_CONFIDENCE = 0.92`，定義於 `app/matching/matcher.py`，其他模組一律 import，不得複製字面值
@@ -32,7 +32,7 @@
 | `app/storage/layout.py` | Windows 檔名淨化、輸出路徑生成（純函式） |
 | `app/matching/matcher.py` | 標題正規化、候選評分、排序（純函式） |
 | `app/sources/youtube.py` | 網址分類、yt-dlp probe、雙串流下載、opus remux |
-| `app/sources/kkbox.py` | KKBOX 搜尋與頁面解析、封面下載 |
+| `app/sources/musicbrainz.py` | MusicBrainz 查詢、JSON 對映、封面網址 |
 | `app/tagging/writer.py` | mutagen 標籤寫入（m4a / opus 雙實作）、JPEG 尺寸解析 |
 | `app/jobs/store.py` | SQLite schema、任務與曲目 CRUD、狀態機 |
 | `app/pipeline.py` | 串接 probe → match → download → tag → 落檔 |
@@ -312,7 +312,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True, slots=True)
 class SourceTrack:
-    """從 YouTube Music 抽出的原始曲目資訊，尚未經過 KKBOX 補齊。"""
+    """從 YouTube Music 抽出的原始曲目資訊，尚未經過外部 metadata 補齊。"""
 
     video_id: str
     url: str
@@ -1358,140 +1358,250 @@ git commit -m "feat: 雙串流下載與 opus 無損 remux"
 
 ---
 
-## Task 7: KKBOX metadata 解析
+## Task 7: MusicBrainz metadata 查詢
 
 **Files:**
-- Create: `app/sources/kkbox.py`
-- Create: `tests/fixtures/kkbox_search.html`（Step 1 擷取）
-- Create: `tests/fixtures/kkbox_album.html`（Step 1 擷取）
-- Create: `tests/test_kkbox.py`
+- Create: `app/sources/musicbrainz.py`
+- Create: `tests/fixtures/mb_recording_search.json`（Step 1 擷取）
+- Create: `tests/fixtures/mb_release.json`（Step 1 擷取）
+- Create: `tests/test_musicbrainz.py`
 
 **Interfaces:**
 - Consumes: `app.models.TrackMeta`
 - Produces:
-  - `KkboxParseError`
-  - `parse_search_results(html: str) -> list[str]`（回傳歌曲頁絕對網址）
-  - `parse_song_page(html: str) -> TrackMeta`
-  - `parse_album_page(html: str) -> list[TrackMeta]`
+  - `MusicBrainzError(RuntimeError)`
+  - `make_client() -> httpx.Client`
+  - `search_recordings(query: str, *, client: httpx.Client, limit: int = 3) -> list[dict]`
+  - `to_track_meta(recording: dict) -> TrackMeta`
+  - `cover_url_for_release(release_mbid: str) -> str`
   - `search(query: str, *, client: httpx.Client) -> list[TrackMeta]`
   - `fetch_cover(url: str, *, client: httpx.Client) -> bytes`
 
+### 為何是 MusicBrainz 而不是 KKBOX
+
+原設計以 KKBOX 為 metadata 來源。實作時實測發現其專輯與歌曲頁已由 AWS WAF 攔截程式化存取：回應 `HTTP 202`、標頭 `x-amzn-waf-action: challenge`、內容零位元組。繞過機器人驗證不在選項內，且即使人工存下 HTML 當 fixture，執行期一樣被擋 —— 那只會做出「測試全綠、實際一跑就死」的模組。
+
+MusicBrainz 是公開的音樂資料庫，其 Web Service 本就是給程式化存取用的，封面走 Cover Art Archive。
+
+### MusicBrainz 的硬性規定（違反會被拒絕服務）
+
+1. **User-Agent 必須帶應用名稱與聯絡方式。** 泛用瀏覽器 UA 會收到 403。格式：`music-downloader/0.1.0 ( <contact> )`。
+   聯絡方式從環境變數 `MUSICBRAINZ_CONTACT` 讀取，預設值為說明字串，README 指示使用者填自己的 email。**不得把個人 email 寫死在程式碼裡。**
+2. **匿名速率上限為每秒 1 次請求。** 模組內以最小間隔強制，不可只靠呼叫端自律。
+3. `recording.length` 單位是**毫秒**，`TrackMeta.duration` 是秒 —— 必須除以 1000。這是最容易出錯的一點。
+
 - [ ] **Step 1: 擷取真實 fixture（手動執行一次，之後測試全離線）**
 
-KKBOX 的頁面結構會改版，因此**不在計畫中猜 selector**，而是先抓一份真實 HTML 存檔，再照著實際結構寫解析器。
+先確認能連上並看清實際 JSON 結構，再寫解析器 —— 不預猜欄位路徑。
 
 ```bash
 .venv/Scripts/python.exe -c "
-import httpx, pathlib
+import httpx, json, pathlib, time
 pathlib.Path('tests/fixtures').mkdir(parents=True, exist_ok=True)
-h = {'User-Agent': 'Mozilla/5.0'}
-with httpx.Client(headers=h, follow_redirects=True, timeout=20) as c:
-    r = c.get('https://www.kkbox.com/tw/tc/search', params={'word': '指尖笑 人間驚鴻宴'})
-    r.raise_for_status()
-    pathlib.Path('tests/fixtures/kkbox_search.html').write_text(r.text, encoding='utf-8')
+ua = {'User-Agent': 'music-downloader/0.1.0 ( local-personal-use )'}
+with httpx.Client(headers=ua, timeout=20, follow_redirects=True) as c:
+    r = c.get('https://musicbrainz.org/ws/2/recording',
+              params={'query': 'recording:\"Bohemian Rhapsody\" AND artist:\"Queen\"',
+                      'fmt': 'json', 'limit': 3})
     print('search', r.status_code, len(r.text))
+    r.raise_for_status()
+    pathlib.Path('tests/fixtures/mb_recording_search.json').write_text(r.text, encoding='utf-8')
+    data = r.json()
+    rec = data['recordings'][0]
+    rel = rec['releases'][0]
+    print('recording keys:', sorted(rec.keys()))
+    print('release keys:', sorted(rel.keys()))
+    print(json.dumps(rec, ensure_ascii=False, indent=2)[:2500])
+    time.sleep(1.2)
+    r2 = c.get(f'https://musicbrainz.org/ws/2/release/{rel[\"id\"]}',
+               params={'inc': 'recordings+artist-credits', 'fmt': 'json'})
+    print('release', r2.status_code, len(r2.text))
+    r2.raise_for_status()
+    pathlib.Path('tests/fixtures/mb_release.json').write_text(r2.text, encoding='utf-8')
 "
 ```
 
-從存下的 HTML 找出一個歌曲頁網址與其專輯頁網址，同法各存一份為 `kkbox_song.html`、`kkbox_album.html`。
+同樣手法再抓一組中文專輯（例如 `recording:"稻香" AND artist:"周杰倫"`），確認中文欄位正常，存為 `tests/fixtures/mb_recording_search_cjk.json`。
 
-**接著檢查 fixture 內是否含 `application/ld+json`：**
+**接著實際檢查曲序資料在哪裡：**
 
 ```bash
 .venv/Scripts/python.exe -c "
-import pathlib, re
-for name in ['kkbox_search','kkbox_song','kkbox_album']:
-    t = pathlib.Path(f'tests/fixtures/{name}.html').read_text(encoding='utf-8')
-    print(name, 'ld+json blocks:', len(re.findall(r'application/ld\+json', t)))
+import json, pathlib
+d = json.loads(pathlib.Path('tests/fixtures/mb_recording_search.json').read_text(encoding='utf-8'))
+rec = d['recordings'][0]
+print('length(ms):', rec.get('length'))
+print('artist-credit:', json.dumps(rec.get('artist-credit'), ensure_ascii=False)[:500])
+for rel in rec.get('releases', [])[:2]:
+    print('--- release', rel.get('title'), rel.get('date'))
+    print('  media:', json.dumps(rel.get('media'), ensure_ascii=False)[:800])
 "
 ```
 
-若歌曲／專輯頁含 ld+json（`MusicRecording` / `MusicAlbum` schema），解析以它為主、`og:` meta 為輔——這兩者比 CSS class 穩定得多。若不含，改以 `og:title`、`og:image`、`og:description` 等 meta 標籤為主，並在 `kkbox.py` 頂端註明實際採用的來源。
+搜尋結果內的 `releases[].media[]` 通常已含 `track-count` 與 `track[].position` —— 若確實如此，一次搜尋即可組出完整 `TrackMeta`，不必再打第二支 API。**依實際觀察決定**，並把結論寫進 `musicbrainz.py` 頂端註解。
 
-- [ ] **Step 2: 寫失敗測試 `tests/test_kkbox.py`**
+若 MusicBrainz 回 403 或連不上，停下來報 NEEDS_CONTEXT，不要偽造 fixture。
 
-依 Step 1 觀察到的實際內容填入 assert 的預期值（下方 `EXPECTED_*` 常數）。
+- [ ] **Step 2: 寫失敗測試 `tests/test_musicbrainz.py`**
+
+依 Step 1 觀察到的實際內容填入 `EXPECTED_*` 常數。
 
 ```python
+import json
 from pathlib import Path
 
 import httpx
 import pytest
 
-from app.sources.kkbox import (
-    KkboxParseError,
+from app.models import TrackMeta
+from app.sources.musicbrainz import (
+    MusicBrainzError,
+    cover_url_for_release,
     fetch_cover,
-    parse_album_page,
-    parse_search_results,
-    parse_song_page,
+    make_client,
     search,
+    search_recordings,
+    to_track_meta,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
 # 依 Step 1 實際擷取到的內容填寫
-EXPECTED_SONG_TITLE = "人間驚鴻宴"
-EXPECTED_SONG_ARTIST = "指尖笑"
+EXPECTED_TITLE = "Bohemian Rhapsody"
+EXPECTED_ARTIST = "Queen"
 
 
-def _fixture(name: str) -> str:
-    return (FIXTURES / name).read_text(encoding="utf-8")
+def _fixture(name: str) -> dict:
+    return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
 
-def test_parse_search_results_returns_song_urls():
-    urls = parse_search_results(_fixture("kkbox_search.html"))
-    assert urls, "搜尋頁應解析出至少一個結果"
-    assert all(u.startswith("https://www.kkbox.com/") for u in urls)
-    assert all("/song/" in u for u in urls)
+def _first_recording() -> dict:
+    return _fixture("mb_recording_search.json")["recordings"][0]
 
 
-def test_parse_search_results_on_empty_page():
-    assert parse_search_results("<html><body>no results</body></html>") == []
+def test_make_client_sets_contactable_user_agent(monkeypatch):
+    monkeypatch.setenv("MUSICBRAINZ_CONTACT", "someone@example.com")
+    with make_client() as client:
+        ua = client.headers["User-Agent"]
+    assert "music-downloader" in ua
+    assert "someone@example.com" in ua
 
 
-def test_parse_song_page_extracts_core_fields():
-    meta = parse_song_page(_fixture("kkbox_song.html"))
-    assert meta.title == EXPECTED_SONG_TITLE
-    assert EXPECTED_SONG_ARTIST in meta.artists
+def test_make_client_user_agent_is_not_a_browser_ua():
+    """泛用瀏覽器 UA 會被 MusicBrainz 拒絕，必須是可辨識的應用名稱。"""
+    with make_client() as client:
+        assert "Mozilla" not in client.headers["User-Agent"]
+
+
+def test_to_track_meta_core_fields():
+    meta = to_track_meta(_first_recording())
+    assert isinstance(meta, TrackMeta)
+    assert meta.title == EXPECTED_TITLE
+    assert EXPECTED_ARTIST in meta.artists
+    assert isinstance(meta.artists, tuple)
     assert meta.album
-    assert meta.cover_url and meta.cover_url.startswith("http")
+    assert meta.source_url and meta.source_url.startswith("https://musicbrainz.org/recording/")
 
 
-def test_parse_song_page_raises_on_garbage():
-    with pytest.raises(KkboxParseError):
-        parse_song_page("<html><body></body></html>")
+def test_to_track_meta_converts_milliseconds_to_seconds():
+    """MusicBrainz 的 length 是毫秒，TrackMeta.duration 是秒。"""
+    recording = dict(_first_recording())
+    recording["length"] = 207000
+    assert to_track_meta(recording).duration == 207
 
 
-def test_parse_album_page_returns_ordered_tracks():
-    tracks = parse_album_page(_fixture("kkbox_album.html"))
-    assert len(tracks) >= 1
-    assert [t.track_no for t in tracks] == list(range(1, len(tracks) + 1))
-    assert all(t.track_total == len(tracks) for t in tracks)
-    assert len({t.album for t in tracks}) == 1
+def test_to_track_meta_handles_missing_length():
+    recording = dict(_first_recording())
+    recording.pop("length", None)
+    assert to_track_meta(recording).duration is None
 
 
-def test_search_uses_client_and_never_touches_network():
-    calls = []
+def test_to_track_meta_extracts_year_from_date():
+    meta = to_track_meta(_first_recording())
+    assert meta.year is None or 1900 <= meta.year <= 2100
+
+
+def test_to_track_meta_sets_track_position_and_total():
+    meta = to_track_meta(_first_recording())
+    if meta.track_no is not None:
+        assert meta.track_no >= 1
+        assert meta.track_total is None or meta.track_total >= meta.track_no
+
+
+def test_to_track_meta_raises_without_title():
+    with pytest.raises(MusicBrainzError):
+        to_track_meta({"id": "x"})
+
+
+def test_to_track_meta_handles_recording_without_releases():
+    """單曲未收錄於任何專輯時，album 退回曲名，不得炸掉。"""
+    recording = {"id": "x", "title": "孤兒曲", "artist-credit": [{"name": "某人"}]}
+    meta = to_track_meta(recording)
+    assert meta.album == "孤兒曲"
+    assert meta.track_no is None
+
+
+def test_to_track_meta_cjk_fixture():
+    recording = _fixture("mb_recording_search_cjk.json")["recordings"][0]
+    meta = to_track_meta(recording)
+    assert meta.title
+    assert meta.artists
+
+
+def test_cover_url_points_at_cover_art_archive():
+    url = cover_url_for_release("abc-123")
+    assert url == "https://coverartarchive.org/release/abc-123/front-500"
+
+
+def test_search_recordings_sends_required_params():
+    captured = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(str(request.url))
-        if "search" in str(request.url):
-            return httpx.Response(200, text=_fixture("kkbox_search.html"))
-        return httpx.Response(200, text=_fixture("kkbox_song.html"))
+        captured["url"] = str(request.url)
+        return httpx.Response(200, json=_fixture("mb_recording_search.json"))
 
-    transport = httpx.MockTransport(handler)
-    with httpx.Client(transport=transport) as client:
-        results = search("指尖笑 人間驚鴻宴", client=client)
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        results = search_recordings("Queen Bohemian Rhapsody", client=client, limit=3)
 
     assert results
-    assert results[0].title == EXPECTED_SONG_TITLE
-    assert any("search" in c for c in calls)
+    assert "fmt=json" in captured["url"]
+    assert "limit=3" in captured["url"]
+
+
+def test_search_returns_track_meta_list():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_fixture("mb_recording_search.json"))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        results = search("Queen Bohemian Rhapsody", client=client)
+
+    assert results
+    assert all(isinstance(m, TrackMeta) for m in results)
+    assert results[0].title == EXPECTED_TITLE
 
 
 def test_search_returns_empty_on_http_error():
-    transport = httpx.MockTransport(lambda r: httpx.Response(503))
-    with httpx.Client(transport=transport) as client:
+    """MusicBrainz 掛掉不得中斷下載 —— 呼叫端會降級用 YouTube 自身 metadata。"""
+    with httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(503))) as client:
         assert search("任何字串", client=client) == []
+
+
+def test_search_returns_empty_on_malformed_payload():
+    with httpx.Client(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"nope": 1}))
+    ) as client:
+        assert search("任何字串", client=client) == []
+
+
+def test_search_skips_unparseable_recording_but_keeps_others():
+    payload = {"recordings": [{"id": "bad"}, _first_recording()]}
+
+    with httpx.Client(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json=payload))
+    ) as client:
+        results = search("任何字串", client=client)
+
+    assert [m.title for m in results] == [EXPECTED_TITLE]
 
 
 def test_fetch_cover_returns_bytes():
@@ -1499,284 +1609,263 @@ def test_fetch_cover_returns_bytes():
         lambda r: httpx.Response(200, content=b"\xff\xd8\xff\xe0jpegdata")
     )
     with httpx.Client(transport=transport) as client:
-        assert fetch_cover("https://i.kfs.io/x/cover.jpg", client=client).startswith(b"\xff\xd8")
+        assert fetch_cover("https://coverartarchive.org/release/x/front-500",
+                           client=client).startswith(b"\xff\xd8")
 
 
-def test_fetch_cover_raises_on_error():
-    transport = httpx.MockTransport(lambda r: httpx.Response(404))
-    with httpx.Client(transport=transport) as client:
+def test_fetch_cover_raises_on_missing_art():
+    """Cover Art Archive 沒有圖時回 404，呼叫端要能分辨。"""
+    with httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(404))) as client:
         with pytest.raises(httpx.HTTPStatusError):
-            fetch_cover("https://i.kfs.io/x/cover.jpg", client=client)
+            fetch_cover("https://coverartarchive.org/release/x/front-500", client=client)
 ```
 
 - [ ] **Step 3: 執行測試確認失敗**
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_kkbox.py -v`
-Expected: FAIL — `ModuleNotFoundError: No module named 'app.sources.kkbox'`
+Run: `.venv/Scripts/python.exe -m pytest tests/test_musicbrainz.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'app.sources.musicbrainz'`
 
-- [ ] **Step 4: 實作 `app/sources/kkbox.py`**
+- [ ] **Step 4: 實作 `app/sources/musicbrainz.py`**
 
-下方是骨架與穩定部分。`_extract_ld_json` 與 `parse_*` 內部的欄位取法，依 Step 1 觀察到的實際結構調整；**所有 selector 與 JSON 路徑只寫在這個檔案裡**，改版時只需改這裡。
+下方是骨架。`to_track_meta` 內部的欄位路徑依 Step 1 觀察到的實際 JSON 調整；**所有欄位路徑只寫在這個檔案裡**，MusicBrainz 改版時只需改這裡。
 
 ```python
-"""KKBOX 公開 metadata 來源。
+"""MusicBrainz 公開 metadata 來源。
 
-僅讀取公開頁面上的曲目資訊與封面圖網址，用於補齊本地檔案標籤。
+僅讀取公開音樂資料庫的曲目資訊與封面圖網址，用於補齊本地檔案標籤。
 不涉及任何音訊取得或 DRM 處理 —— 音訊一律來自 YouTube Music。
 
-解析優先序：JSON-LD（application/ld+json）> og: meta 標籤 > CSS selector。
-前兩者比 class 名稱穩定，改版存活率高。
+MusicBrainz 的兩條硬性規定：
+  1. User-Agent 必須可辨識並帶聯絡方式，泛用瀏覽器 UA 會收到 403
+  2. 匿名存取每秒至多 1 次請求
+
+recording.length 單位是毫秒，TrackMeta.duration 是秒。
 """
 
 from __future__ import annotations
 
-import json
-import re
+import os
+import threading
 import time
-from urllib.parse import urljoin
 
 import httpx
-from bs4 import BeautifulSoup
 
 from app.models import TrackMeta
 
-BASE_URL = "https://www.kkbox.com"
-SEARCH_URL = f"{BASE_URL}/tw/tc/search"
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-# 禮貌性請求間隔，避免對站台造成負擔
-REQUEST_DELAY_SECONDS = 1.0
+WS_BASE = "https://musicbrainz.org/ws/2"
+COVER_ART_BASE = "https://coverartarchive.org/release"
+APP_VERSION = "0.1.0"
+DEFAULT_CONTACT = "set MUSICBRAINZ_CONTACT to your email"
+# MusicBrainz 匿名速率上限：每秒 1 次
+MIN_REQUEST_INTERVAL_SECONDS = 1.1
 MAX_SEARCH_RESULTS = 3
 
-_YEAR = re.compile(r"(\d{4})")
+_rate_lock = threading.Lock()
+_last_request_at = 0.0
 
 
-class KkboxParseError(ValueError):
-    """頁面結構與預期不符，多半是 KKBOX 改版了。"""
+class MusicBrainzError(RuntimeError):
+    """回應結構與預期不符，或缺少組成標籤的必要欄位。"""
+
+
+def _user_agent() -> str:
+    contact = os.environ.get("MUSICBRAINZ_CONTACT", DEFAULT_CONTACT)
+    return f"music-downloader/{APP_VERSION} ( {contact} )"
 
 
 def make_client() -> httpx.Client:
     return httpx.Client(
-        headers={"User-Agent": USER_AGENT, "Accept-Language": "zh-TW,zh;q=0.9"},
+        headers={"User-Agent": _user_agent(), "Accept": "application/json"},
         follow_redirects=True,
         timeout=20.0,
     )
 
 
-def _soup(html: str) -> BeautifulSoup:
-    return BeautifulSoup(html, "lxml")
+def _throttle() -> None:
+    """強制請求間隔。多執行緒共用同一節流器。"""
+    global _last_request_at
+    with _rate_lock:
+        elapsed = time.monotonic() - _last_request_at
+        if elapsed < MIN_REQUEST_INTERVAL_SECONDS:
+            time.sleep(MIN_REQUEST_INTERVAL_SECONDS - elapsed)
+        _last_request_at = time.monotonic()
 
 
-def _ld_json_blocks(soup: BeautifulSoup) -> list[dict]:
-    blocks: list[dict] = []
-    for tag in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(tag.string or "")
-        except (json.JSONDecodeError, TypeError):
-            continue
-        blocks.extend(data if isinstance(data, list) else [data])
-    return blocks
-
-
-def _ld_of_type(soup: BeautifulSoup, *types: str) -> dict | None:
-    wanted = {t.lower() for t in types}
-    for block in _ld_json_blocks(soup):
-        block_type = block.get("@type", "")
-        if isinstance(block_type, list):
-            if any(str(t).lower() in wanted for t in block_type):
-                return block
-        elif str(block_type).lower() in wanted:
-            return block
-    return None
-
-
-def _meta_content(soup: BeautifulSoup, prop: str) -> str | None:
-    tag = soup.find("meta", property=prop) or soup.find("meta", attrs={"name": prop})
-    if tag is None:
-        return None
-    content = tag.get("content")
-    return content.strip() if content else None
-
-
-def _year_from(value: str | None) -> int | None:
-    if not value:
-        return None
-    match = _YEAR.search(value)
-    return int(match.group(1)) if match else None
-
-
-def _names(value) -> tuple[str, ...]:
-    """把 JSON-LD 的 byArtist 之類欄位攤平成名字 tuple。"""
-    if value is None:
+def _artist_names(credit) -> tuple[str, ...]:
+    """把 artist-credit 陣列攤平成名字 tuple。"""
+    if not isinstance(credit, list):
         return ()
-    if isinstance(value, str):
-        return (value.strip(),)
-    if isinstance(value, dict):
-        name = value.get("name")
-        return (name.strip(),) if isinstance(name, str) and name.strip() else ()
-    if isinstance(value, (list, tuple)):
-        out: list[str] = []
-        for item in value:
-            out.extend(_names(item))
-        return tuple(out)
-    return ()
+    names = []
+    for item in credit:
+        if isinstance(item, dict):
+            name = item.get("name") or (item.get("artist") or {}).get("name")
+            if isinstance(name, str) and name.strip():
+                names.append(name.strip())
+    return tuple(names)
 
 
-def _duration_seconds(iso: str | None) -> int | None:
-    """解析 ISO 8601 期間，例如 PT3M27S。"""
-    if not iso:
+def _year_from_date(date: str | None) -> int | None:
+    if not isinstance(date, str) or len(date) < 4 or not date[:4].isdigit():
         return None
-    match = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", iso.strip())
-    if not match:
+    return int(date[:4])
+
+
+def _pick_release(recording: dict) -> dict | None:
+    """挑一張代表專輯。優先有日期者，其次第一張。"""
+    releases = recording.get("releases")
+    if not isinstance(releases, list) or not releases:
         return None
-    hours, minutes, seconds = (int(g) if g else 0 for g in match.groups())
-    total = hours * 3600 + minutes * 60 + seconds
-    return total or None
+    dated = [r for r in releases if isinstance(r, dict) and r.get("date")]
+    return (dated or releases)[0]
 
 
-def parse_search_results(html: str) -> list[str]:
-    """從搜尋頁抽出歌曲頁網址，維持頁面上的排序。"""
-    soup = _soup(html)
-    urls: list[str] = []
-    seen: set[str] = set()
-    for anchor in soup.find_all("a", href=True):
-        href = anchor["href"]
-        if "/song/" not in href:
-            continue
-        absolute = urljoin(BASE_URL, href.split("?")[0])
-        if absolute not in seen:
-            seen.add(absolute)
-            urls.append(absolute)
-    return urls
-
-
-def parse_song_page(html: str) -> TrackMeta:
-    soup = _soup(html)
-    ld = _ld_of_type(soup, "MusicRecording", "MusicComposition")
-    og_title = _meta_content(soup, "og:title")
-
-    title = (ld or {}).get("name") or og_title
-    if not title:
-        raise KkboxParseError("歌曲頁找不到標題，KKBOX 可能改版了")
-
-    artists = _names((ld or {}).get("byArtist")) or ()
-    album_block = (ld or {}).get("inAlbum") or {}
-    album = album_block.get("name") if isinstance(album_block, dict) else None
-    cover = (ld or {}).get("image") or _meta_content(soup, "og:image")
-    if isinstance(cover, list):
-        cover = cover[0] if cover else None
-
-    return TrackMeta(
-        title=str(title).strip(),
-        artists=artists,
-        album_artist=artists[0] if artists else "",
-        album=str(album).strip() if album else str(title).strip(),
-        year=_year_from((ld or {}).get("datePublished")),
-        track_no=None,
-        track_total=None,
-        genre=(ld or {}).get("genre") if isinstance((ld or {}).get("genre"), str) else None,
-        cover_url=str(cover) if cover else None,
-        duration=_duration_seconds((ld or {}).get("duration")),
-        source_url=_meta_content(soup, "og:url"),
+def _track_position(release: dict) -> tuple[int | None, int | None]:
+    """從 release.media 取出曲序與總曲數。結構缺漏時回 (None, None)。"""
+    media = release.get("media")
+    if not isinstance(media, list) or not media:
+        return (None, None)
+    first = media[0]
+    if not isinstance(first, dict):
+        return (None, None)
+    total = first.get("track-count")
+    tracks = first.get("track")
+    position = None
+    if isinstance(tracks, list) and tracks and isinstance(tracks[0], dict):
+        position = tracks[0].get("position") or tracks[0].get("number")
+    return (
+        int(position) if isinstance(position, (int, str)) and str(position).isdigit() else None,
+        int(total) if isinstance(total, int) else None,
     )
 
 
-def parse_album_page(html: str) -> list[TrackMeta]:
-    """回傳整張專輯的曲目，曲序依頁面順序自 1 起編。"""
-    soup = _soup(html)
-    ld = _ld_of_type(soup, "MusicAlbum")
-    if ld is None:
-        raise KkboxParseError("專輯頁找不到 MusicAlbum 結構，KKBOX 可能改版了")
+def cover_url_for_release(release_mbid: str) -> str:
+    return f"{COVER_ART_BASE}/{release_mbid}/front-500"
 
-    album_name = str(ld.get("name") or "").strip()
-    album_artists = _names(ld.get("byArtist"))
-    year = _year_from(ld.get("datePublished"))
-    cover = ld.get("image")
-    if isinstance(cover, list):
-        cover = cover[0] if cover else None
-    genre = ld.get("genre") if isinstance(ld.get("genre"), str) else None
-    source_url = _meta_content(soup, "og:url")
 
-    tracks_block = ld.get("track") or ld.get("tracks") or []
-    if isinstance(tracks_block, dict):
-        tracks_block = tracks_block.get("itemListElement") or []
-    items = [t.get("item", t) if isinstance(t, dict) else t for t in tracks_block]
-    items = [i for i in items if isinstance(i, dict) and i.get("name")]
-    if not items:
-        raise KkboxParseError("專輯頁沒有曲目清單")
+def to_track_meta(recording: dict) -> TrackMeta:
+    """把一筆 MusicBrainz recording 轉成 TrackMeta。"""
+    title = recording.get("title")
+    if not isinstance(title, str) or not title.strip():
+        raise MusicBrainzError(f"recording 缺少 title：{recording.get('id')!r}")
+    title = title.strip()
 
-    total = len(items)
-    return [
-        TrackMeta(
-            title=str(item["name"]).strip(),
-            artists=_names(item.get("byArtist")) or album_artists,
-            album_artist=album_artists[0] if album_artists else "",
-            album=album_name,
-            year=year,
-            track_no=index,
-            track_total=total,
-            genre=genre,
-            cover_url=str(cover) if cover else None,
-            duration=_duration_seconds(item.get("duration")),
-            source_url=source_url,
-        )
-        for index, item in enumerate(items, start=1)
-    ]
+    artists = _artist_names(recording.get("artist-credit"))
+    release = _pick_release(recording)
+
+    if release is None:
+        album = title
+        album_artists: tuple[str, ...] = ()
+        year = None
+        track_no = track_total = None
+        cover_url = None
+    else:
+        album = (release.get("title") or title).strip()
+        album_artists = _artist_names(release.get("artist-credit"))
+        year = _year_from_date(release.get("date"))
+        track_no, track_total = _track_position(release)
+        cover_url = cover_url_for_release(release["id"]) if release.get("id") else None
+
+    length_ms = recording.get("length")
+    duration = int(length_ms) // 1000 if isinstance(length_ms, (int, float)) else None
+
+    return TrackMeta(
+        title=title,
+        artists=artists,
+        album_artist=(album_artists or artists or ("",))[0],
+        album=album,
+        year=year,
+        track_no=track_no,
+        track_total=track_total,
+        genre=None,
+        cover_url=cover_url,
+        duration=duration,
+        source_url=f"https://musicbrainz.org/recording/{recording['id']}"
+        if recording.get("id")
+        else None,
+    )
+
+
+def search_recordings(
+    query: str, *, client: httpx.Client, limit: int = MAX_SEARCH_RESULTS
+) -> list[dict]:
+    """呼叫 recording 搜尋端點，回傳原始 recording dict 清單。"""
+    _throttle()
+    response = client.get(
+        f"{WS_BASE}/recording",
+        params={"query": query, "fmt": "json", "limit": limit},
+    )
+    response.raise_for_status()
+    payload = response.json()
+    recordings = payload.get("recordings")
+    if not isinstance(recordings, list):
+        raise MusicBrainzError("回應缺少 recordings 陣列")
+    return recordings
 
 
 def search(query: str, *, client: httpx.Client) -> list[TrackMeta]:
-    """搜尋並取回前幾筆候選的完整 metadata。
+    """搜尋並轉成 TrackMeta 候選清單。
 
     任何網路或解析失敗都回空清單 —— 呼叫端會降級用 YouTube 自身 metadata，
-    不該因為 KKBOX 出事就中斷下載。
+    不該因為 MusicBrainz 出事就中斷下載。
     """
     try:
-        response = client.get(SEARCH_URL, params={"word": query})
-        response.raise_for_status()
-    except httpx.HTTPError:
+        recordings = search_recordings(query, client=client)
+    except (httpx.HTTPError, MusicBrainzError, ValueError):
         return []
 
     results: list[TrackMeta] = []
-    for url in parse_search_results(response.text)[:MAX_SEARCH_RESULTS]:
-        time.sleep(REQUEST_DELAY_SECONDS)
+    for recording in recordings:
         try:
-            page = client.get(url)
-            page.raise_for_status()
-            results.append(parse_song_page(page.text))
-        except (httpx.HTTPError, KkboxParseError):
+            results.append(to_track_meta(recording))
+        except (MusicBrainzError, KeyError, TypeError):
             continue
     return results
 
 
 def fetch_cover(url: str, *, client: httpx.Client) -> bytes:
+    """抓封面圖。Cover Art Archive 沒有圖時回 404，讓呼叫端自行決定。"""
     response = client.get(url)
     response.raise_for_status()
     return response.content
 ```
 
-- [ ] **Step 5: 依 fixture 實況調整解析並讓測試通過**
+- [ ] **Step 5: 依 fixture 實況調整並讓測試通過**
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_kkbox.py -v`
-Expected: PASS，9 passed
+Run: `.venv/Scripts/python.exe -m pytest tests/test_musicbrainz.py -v`
+Expected: PASS
 
-若 `parse_song_page` 或 `parse_album_page` 失敗，用下列指令印出 fixture 裡的 ld+json 實際結構後對照調整：
+若 `to_track_meta` 的欄位取不到，用下列指令印出 fixture 的實際結構對照調整：
 
 ```bash
 .venv/Scripts/python.exe -c "
 import json, pathlib
-from app.sources.kkbox import _ld_json_blocks, _soup
-html = pathlib.Path('tests/fixtures/kkbox_album.html').read_text(encoding='utf-8')
-for b in _ld_json_blocks(_soup(html)):
-    print(json.dumps(b, ensure_ascii=False, indent=2)[:3000])
+d = json.loads(pathlib.Path('tests/fixtures/mb_recording_search.json').read_text(encoding='utf-8'))
+print(json.dumps(d['recordings'][0], ensure_ascii=False, indent=2)[:4000])
 "
 ```
 
-若 fixture 完全不含 ld+json，改寫 `parse_song_page` / `parse_album_page` 以 `og:` meta 與 CSS selector 為準，其餘函式與測試維持不變。
+- [ ] **Step 6: 節流實測**
 
-- [ ] **Step 6: Commit**
+確認 `_throttle` 真的擋得住連續呼叫（不觸網，只量時間）：
 
 ```bash
-git add app/sources/kkbox.py tests/test_kkbox.py tests/fixtures/
-git commit -m "feat: KKBOX 公開 metadata 解析與搜尋"
+.venv/Scripts/python.exe -c "
+import time
+from app.sources.musicbrainz import _throttle
+t0 = time.monotonic()
+for _ in range(3):
+    _throttle()
+print('3 calls took', round(time.monotonic() - t0, 2), 'seconds (expect >= 2.2)')
+"
+```
+
+預期輸出的秒數 ≥ 2.2。若接近 0，節流沒生效，必須修正。
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add app/sources/musicbrainz.py tests/test_musicbrainz.py tests/fixtures/
+git commit -m "feat: MusicBrainz metadata 查詢與封面網址組合"
 ```
 
 ---
@@ -2452,7 +2541,7 @@ git commit -m "feat: SQLite 任務儲存與曲目狀態機"
 **Interfaces:**
 - Consumes: 全部先前模組
 - Produces:
-  - `Pipeline(store, roots, *, workdir, client_factory=kkbox.make_client, probe_fn=youtube.probe, download_fn=youtube.download_streams, cover_fn=kkbox.fetch_cover, search_fn=kkbox.search, write_fn=tagging.write_tags)`
+  - `Pipeline(store, roots, *, workdir, client_factory=musicbrainz.make_client, probe_fn=youtube.probe, download_fn=youtube.download_streams, cover_fn=musicbrainz.fetch_cover, search_fn=musicbrainz.search, write_fn=tagging.write_tags)`
   - `Pipeline.submit(url: str) -> int`（建 job，probe，比對，狀態停在 `awaiting_confirm`）
   - `Pipeline.finalize(track_id: int) -> None`（下載、寫標籤、落檔）
   - `fallback_meta(source: SourceTrack) -> TrackMeta`
@@ -2568,7 +2657,7 @@ def test_submit_stops_at_awaiting_confirm(pipeline):
     assert track.candidates[0].meta.title == "人間驚鴻宴"
 
 
-def test_submit_falls_back_when_kkbox_empty(tmp_path, pipeline):
+def test_submit_falls_back_when_musicbrainz_empty(tmp_path, pipeline):
     pipeline._search_fn = lambda q, client: []
     job_id = pipeline.submit("https://music.youtube.com/watch?v=v1")
     track = pipeline.store.get_job(job_id).tracks[0]
@@ -2671,13 +2760,13 @@ from app.config import LibraryRoots
 from app.jobs.store import JobStore, TrackStatus
 from app.matching.matcher import rank_candidates, split_title
 from app.models import Candidate, SourceTrack, TrackMeta
-from app.sources import kkbox, youtube
+from app.sources import musicbrainz, youtube
 from app.storage.layout import build_paths
 from app.tagging.writer import write_tags
 
 
 def fallback_meta(source: SourceTrack) -> TrackMeta:
-    """KKBOX 查無結果時，用 YouTube 自身資料組出堪用標籤。"""
+    """MusicBrainz 查無結果時，用 YouTube 自身資料組出堪用標籤。"""
     if source.track:
         title = source.track
         artist = source.artist
@@ -2707,11 +2796,11 @@ class Pipeline:
         roots: LibraryRoots,
         *,
         workdir: Path,
-        client_factory=kkbox.make_client,
+        client_factory=musicbrainz.make_client,
         probe_fn=youtube.probe,
-        search_fn=kkbox.search,
+        search_fn=musicbrainz.search,
         download_fn=youtube.download_streams,
-        cover_fn=kkbox.fetch_cover,
+        cover_fn=musicbrainz.fetch_cover,
         write_fn=write_tags,
     ) -> None:
         self.store = store
@@ -2754,7 +2843,7 @@ class Pipeline:
         if metas:
             candidates = rank_candidates(source, metas)
         else:
-            # 降級：用 YouTube 自身資料，分數 0 代表未經 KKBOX 比對
+            # 降級：用 YouTube 自身資料，分數 0 代表未經 MusicBrainz 比對
             candidates = [Candidate(meta=fallback_meta(source), score=0.0)]
         self.store.set_candidates(track_id, candidates)
 
@@ -3260,7 +3349,7 @@ git commit -m "feat: HTTP API 與 SSE 進度推播"
 <body>
   <header>
     <h1>音樂下載工具</h1>
-    <p class="hint">貼上 YouTube Music 網址，一行一個。標籤由 KKBOX 公開資料補齊，下載前需確認。</p>
+    <p class="hint">貼上 YouTube Music 網址，一行一個。標籤由 MusicBrainz 公開資料補齊，下載前需確認。</p>
   </header>
 
   <section class="submit">
@@ -3589,12 +3678,13 @@ git commit -m "feat: 網頁前端與 SSE 進度顯示"
 ```markdown
 # 音樂下載工具
 
-個人本機音樂收藏工具。從 YouTube Music 取得音訊，以 KKBOX 公開 metadata 補齊標籤與封面，依演出者／專輯結構落檔。
+個人本機音樂收藏工具。從 YouTube Music 取得音訊，以 MusicBrainz 公開 metadata 補齊標籤與封面，依演出者／專輯結構落檔。
 
 ## 範圍與限制
 
 - 音訊唯一來源為 YouTube Music，用途限個人本機收藏。
-- KKBOX 僅作為公開 metadata 來源。**本工具不解密、不繞過任何 DRM。**
+- 原設計以 KKBOX 為 metadata 來源，因其專輯與歌曲頁已由 AWS WAF 攔截程式化存取而改用 MusicBrainz。
+- metadata 來自 MusicBrainz 公開 API，封面來自 Cover Art Archive。**本工具不解密、不繞過任何 DRM。**
 - YouTube Music 沒有無損來源。本工具不重編碼，只做容器 remux。
 
 ## 需求
@@ -3618,6 +3708,7 @@ git commit -m "feat: 網頁前端與 SSE 進度顯示"
 | 環境變數 | 預設值 | 說明 |
 |---|---|---|
 | `MUSIC_ROOT` | `D:\Music` | m4a 輸出根目錄，供播放器掃描 |
+| `MUSICBRAINZ_CONTACT` | 未設定 | MusicBrainz 要求 User-Agent 帶聯絡方式，請填自己的 email |
 | `ARCHIVE_ROOT` | `D:\Archive` | opus 輸出根目錄，冷存不掃描 |
 
 ## 輸出格式
@@ -3632,7 +3723,7 @@ git commit -m "feat: 網頁前端與 SSE 進度顯示"
 ## 使用流程
 
 1. 貼上網址（支援單曲、專輯、播放清單，一行一個）
-2. 系統探測曲目並產生候選標籤，停在「待確認」
+2. 系統探測曲目並向 MusicBrainz 查詢候選標籤，停在「待確認」
 3. 逐首確認或修改標籤後按「確認並下載」
 4. 下載、寫標籤、落檔
 
@@ -3642,14 +3733,14 @@ git commit -m "feat: 網頁前端與 SSE 進度顯示"
 
     .venv\Scripts\python.exe -m pytest -v
 
-測試不對 KKBOX 或 YouTube 發出任何請求，全部使用 fixture 與 mock。
+測試不對 MusicBrainz 或 YouTube 發出任何請求，全部使用 fixture 與 mock。
 
 ## 疑難排解
 
 | 症狀 | 原因與處理 |
 |---|---|
 | 啟動即報 ffmpeg 錯誤 | ffmpeg 不在 PATH。安裝後需重開終端機 |
-| 候選全部顯示「未配對」 | KKBOX 查無結果或已改版。標籤會降級使用 YouTube 自身資料，仍可下載 |
+| 候選全部顯示「未配對」 | MusicBrainz 查無結果，或未設定 `MUSICBRAINZ_CONTACT` 導致請求被拒。標籤會降級使用 YouTube 自身資料，仍可下載 |
 | 檔案總管看不到 opus 的標籤 | 預期行為。改用 foobar2000、MusicBee 或 VLC 檢視 |
 | 曲目狀態卡在「失敗」 | 展開錯誤訊息。影片下架或地區限制無法處理，其餘可重新送出網址 |
 ```
@@ -3669,21 +3760,21 @@ git commit -m "docs: 使用說明與疑難排解"
 
 | Spec 章節 | 對應任務 |
 |---|---|
-| 1 目的與範圍、法律邊界 | Task 7（僅 metadata）、Task 13（README 明載） |
+| 1 目的與範圍、法律邊界 | Task 7（僅公開 metadata）、Task 13（README 明載） |
 | 2 決策紀錄 | 全部任務；格式決策見 Task 6 |
 | 3 架構與模組邊界 | Task 1–12 檔案結構逐一對應 |
 | 4 資料流與狀態機 | Task 9（狀態機）、Task 10（兩階段流程） |
 | 5 比對演算法 | Task 4 |
 | 6 標籤欄位對映 | Task 8 |
 | 7 檔案落地與檔名淨化 | Task 3、Task 10 |
-| 8 錯誤處理（7 項） | Task 1（ffmpeg）、Task 5（下架跳過）、Task 7（KKBOX 降級與延遲）、Task 10（重複跳過、下載失敗、封面失敗） |
+| 8 錯誤處理（7 項） | Task 1（ffmpeg）、Task 5（下架跳過）、Task 7（MusicBrainz 降級與節流）、Task 10（重複跳過、下載失敗、封面失敗） |
 | 9 測試策略 | 每個任務的 TDD 步驟；fixture 見 Task 7、conftest 見 Task 8 |
 | 10 YAGNI 清單 | 未出現於任何任務 |
 | 11 環境前提 | Task 1 |
 
 **型別一致性檢查：** `TrackMeta` 欄位在 Task 2 定義後，於 Task 3、7、8、9、10、11 使用一致；`artists` 全程為 `tuple[str, ...]`，僅在 JSON 序列化（Task 9、11）與前端（Task 12）轉為 list。`TrackStatus` 值在 Task 9 定義，Task 10、11、12 引用相同字串。`HIGH_CONFIDENCE` 定義於 Task 4，前端 Task 12 的同名常數僅供視覺標示且已註明來源。
 
-**已知需實作時調整之處：** Task 7 的 KKBOX selector 依賴 Step 1 擷取的真實 fixture，計畫刻意不預先猜測頁面結構。
+**已知需實作時調整之處：** Task 7 的 MusicBrainz 欄位路徑依賴 Step 1 擷取的真實 fixture，計畫刻意不預先猜測回應結構。
 
 ---
 

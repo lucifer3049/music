@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True, slots=True)
 class SourceTrack:
-    """從 YouTube Music 抽出的原始曲目資訊，尚未經過 KKBOX 補齊。"""
+    """從 YouTube Music 抽出的原始曲目資訊，尚未經過外部 metadata 補齊。"""
 
     video_id: str
     url: str
