@@ -1,0 +1,79 @@
+:root {
+  color-scheme: light dark;
+  --gap: 12px;
+  --border: color-mix(in srgb, currentColor 20%, transparent);
+}
+
+body {
+  font-family: "Segoe UI", "Microsoft JhengHei", system-ui, sans-serif;
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 24px 16px 64px;
+  line-height: 1.6;
+}
+
+.hint { opacity: 0.7; font-size: 0.9em; }
+
+textarea { width: 100%; font-family: inherit; padding: 8px; box-sizing: border-box; }
+
+button {
+  padding: 6px 14px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+}
+
+button:disabled { opacity: 0.4; cursor: default; }
+
+.submit { display: flex; flex-wrap: wrap; align-items: center; gap: var(--gap); margin-top: var(--gap); }
+.submit textarea { flex: 1 1 100%; }
+
+.job { border-top: 1px solid var(--border); margin-top: 24px; padding-top: 12px; }
+.job-title { font-size: 1.05em; word-break: break-all; }
+
+.track {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: var(--gap);
+  margin-bottom: var(--gap);
+}
+
+.track-head { display: flex; justify-content: space-between; gap: var(--gap); }
+.raw-title { font-weight: 600; }
+
+.status { font-size: 0.85em; opacity: 0.8; white-space: nowrap; }
+.status[data-status="done"] { color: seagreen; }
+.status[data-status="failed"] { color: crimson; }
+.status[data-status="skipped"] { opacity: 0.5; }
+
+.candidates { display: grid; gap: 8px; margin: var(--gap) 0; }
+
+.candidate {
+  display: grid;
+  grid-template-columns: 56px 1fr auto;
+  gap: var(--gap);
+  align-items: center;
+  padding: 6px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.candidate:hover { border-color: var(--border); }
+.candidate.selected { border-color: currentColor; }
+.candidate img { width: 56px; height: 56px; object-fit: cover; border-radius: 3px; background: var(--border); }
+.candidate .fields { font-size: 0.9em; overflow-wrap: anywhere; }
+.candidate .score { font-variant-numeric: tabular-nums; font-size: 0.85em; }
+.candidate .score.high { color: seagreen; font-weight: 600; }
+.candidate .score.low { color: darkorange; }
+
+.actions { display: flex; gap: 8px; }
+
+.error, .action-error, .job-error {
+  color: crimson;
+  font-size: 0.85em;
+  margin: 4px 0 0;
+}
+.error:empty, .action-error:empty, .job-error:empty { display: none; }

@@ -1,11 +1,50 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="zh-Hant">
 <head>
-  <meta charset="utf-8" />
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>音樂下載工具</title>
+  <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <!-- 佔位頁面：Task 12 會用真正的前端（貼上網址、確認標籤、SSE 進度）取代這個檔案。 -->
-  <p>前端尚未實作（Task 12）。API 已可用，見 /docs。</p>
+  <header>
+    <h1>音樂下載工具</h1>
+    <p class="hint">貼上 YouTube Music 網址，一行一個。標籤由 MusicBrainz 公開資料補齊，下載前需確認。</p>
+  </header>
+
+  <section class="submit">
+    <textarea id="urls" rows="4" placeholder="https://music.youtube.com/watch?v=...
+https://music.youtube.com/playlist?list=OLAK5uy_..."></textarea>
+    <button id="submit">送出</button>
+    <span id="submit-status"></span>
+  </section>
+
+  <section id="jobs"></section>
+
+  <template id="job-template">
+    <div class="job">
+      <h2 class="job-title"></h2>
+      <p class="job-error"></p>
+      <div class="tracks"></div>
+    </div>
+  </template>
+
+  <template id="track-template">
+    <article class="track">
+      <div class="track-head">
+        <span class="raw-title"></span>
+        <span class="status"></span>
+      </div>
+      <div class="candidates"></div>
+      <div class="actions">
+        <button class="confirm">確認並下載</button>
+        <button class="skip">跳過</button>
+      </div>
+      <p class="error"></p>
+      <p class="action-error"></p>
+    </article>
+  </template>
+
+  <script src="/app.js"></script>
 </body>
 </html>
