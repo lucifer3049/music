@@ -1,3 +1,5 @@
+import threading
+
 import pytest
 
 from app.jobs.store import JobStore, TrackStatus
@@ -118,8 +120,85 @@ def test_get_track_missing_returns_none(store):
     assert store.get_track(99999) is None
 
 
+def test_get_job_missing_returns_none(store):
+    assert store.get_job(99999) is None
+
+
 def test_schema_is_idempotent(tmp_path):
     s = JobStore(tmp_path / "jobs.db")
     s.init_schema()
     s.init_schema()
     s.close()
+
+
+def test_create_job_concurrent_ids_map_to_correct_url(store):
+    """Regression test for lastrowid cross-thread misattribution.
+
+    sqlite3_last_insert_rowid() is a per-connection value, not per-statement.
+    If N threads INSERT concurrently on the shared connection, one thread's
+    lastrowid read can race with another thread's INSERT and return the
+    wrong id. Each returned id must map back to the job that thread created.
+    """
+    n = 16
+    urls = [f"https://music.youtube.com/watch?v=concurrent-{i}" for i in range(n)]
+    results: list[int | None] = [None] * n
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(n)
+
+    def worker(i: int) -> None:
+        try:
+            barrier.wait()
+            results[i] = store.create_job(urls[i])
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"worker threads raised: {errors}"
+    assert None not in results
+    assert len(set(results)) == n, f"duplicate ids returned: {results}"
+    for i, job_id in enumerate(results):
+        job = store.get_job(job_id)
+        assert job is not None, f"job {job_id} not found"
+        assert job.url == urls[i], (
+            f"thread {i} created url {urls[i]!r} but id {job_id} maps to "
+            f"url {job.url!r} instead"
+        )
+
+
+def test_add_track_concurrent_ids_map_to_correct_video(store):
+    """Same lastrowid race, but for add_track under a single shared job."""
+    job_id = store.create_job("https://music.youtube.com/watch?v=parent")
+    n = 16
+    sources = [_source(f"concurrent-track-{i}") for i in range(n)]
+    results: list[int | None] = [None] * n
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(n)
+
+    def worker(i: int) -> None:
+        try:
+            barrier.wait()
+            results[i] = store.add_track(job_id, sources[i])
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"worker threads raised: {errors}"
+    assert None not in results
+    assert len(set(results)) == n, f"duplicate ids returned: {results}"
+    for i, track_id in enumerate(results):
+        row = store.get_track(track_id)
+        assert row is not None, f"track {track_id} not found"
+        assert row.video_id == sources[i].video_id, (
+            f"thread {i} created video_id {sources[i].video_id!r} but id "
+            f"{track_id} maps to video_id {row.video_id!r} instead"
+        )

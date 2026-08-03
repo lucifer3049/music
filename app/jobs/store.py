@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -75,21 +76,31 @@ def _meta_from_dict(data: dict) -> TrackMeta:
     return TrackMeta(**data)
 
 
-def _dump_meta(meta: TrackMeta) -> str:
+def _meta_to_dict(meta: TrackMeta) -> dict:
     payload = asdict(meta)
     payload["artists"] = list(meta.artists)
-    return json.dumps(payload, ensure_ascii=False)
+    return payload
+
+
+def _dump_meta(meta: TrackMeta) -> str:
+    return json.dumps(_meta_to_dict(meta), ensure_ascii=False)
 
 
 class JobStore:
     def __init__(self, db_path: Path) -> None:
-        self._path = db_path
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        # 背景 thread pool 會共用同一個連線，故關閉 thread 檢查並自行序列化寫入
+        # 背景 thread pool 會共用同一個連線，故關閉 thread 檢查。
+        # sqlite3 底層以 SQLITE_THREADSAFE=1（serialized）編譯，單一陳述式呼叫不會
+        # 造成資料庫損毀，但 sqlite3_last_insert_rowid() 是「連線層級」而非「陳述式
+        # 層級」的值 —— 若兩個執行緒交錯呼叫 INSERT，cursor.lastrowid 可能讀到另一
+        # 執行緒剛寫入的 rowid。因此所有寫入方法一律用 `INSERT ... RETURNING id`
+        # 直接從陳述式結果取得 id，並以下方的 _write_lock 序列化寫入路徑，避免任何
+        # 跨執行緒交錯的驚喜（例如兩個 UPDATE 的先後順序被打亂）。
         self._conn = sqlite3.connect(db_path, check_same_thread=False, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.execute("PRAGMA journal_mode = WAL")
+        self._write_lock = threading.Lock()
 
     def init_schema(self) -> None:
         self._conn.executescript(_SCHEMA)
@@ -100,45 +111,51 @@ class JobStore:
     # --- 寫入 ---
 
     def create_job(self, url: str) -> int:
-        cursor = self._conn.execute(
-            "INSERT INTO jobs (url, created_at) VALUES (?, ?)",
-            (url, datetime.now(timezone.utc).isoformat()),
-        )
-        return int(cursor.lastrowid)
+        with self._write_lock:
+            cursor = self._conn.execute(
+                "INSERT INTO jobs (url, created_at) VALUES (?, ?) RETURNING id",
+                (url, datetime.now(timezone.utc).isoformat()),
+            )
+            return int(cursor.fetchone()["id"])
 
     def add_track(self, job_id: int, source: SourceTrack) -> int:
-        cursor = self._conn.execute(
-            "INSERT INTO tracks (job_id, video_id, source, status) VALUES (?, ?, ?, ?)",
-            (
-                job_id,
-                source.video_id,
-                json.dumps(asdict(source), ensure_ascii=False),
-                TrackStatus.PENDING.value,
-            ),
-        )
-        return int(cursor.lastrowid)
+        with self._write_lock:
+            cursor = self._conn.execute(
+                "INSERT INTO tracks (job_id, video_id, source, status) "
+                "VALUES (?, ?, ?, ?) RETURNING id",
+                (
+                    job_id,
+                    source.video_id,
+                    json.dumps(asdict(source), ensure_ascii=False),
+                    TrackStatus.PENDING.value,
+                ),
+            )
+            return int(cursor.fetchone()["id"])
 
     def set_candidates(self, track_id: int, candidates: list[Candidate]) -> None:
         payload = json.dumps(
-            [{"meta": json.loads(_dump_meta(c.meta)), "score": c.score} for c in candidates],
+            [{"meta": _meta_to_dict(c.meta), "score": c.score} for c in candidates],
             ensure_ascii=False,
         )
-        self._conn.execute(
-            "UPDATE tracks SET candidates = ?, status = ?, error = NULL WHERE id = ?",
-            (payload, TrackStatus.AWAITING_CONFIRM.value, track_id),
-        )
+        with self._write_lock:
+            self._conn.execute(
+                "UPDATE tracks SET candidates = ?, status = ?, error = NULL WHERE id = ?",
+                (payload, TrackStatus.AWAITING_CONFIRM.value, track_id),
+            )
 
     def confirm(self, track_id: int, meta: TrackMeta) -> None:
-        self._conn.execute(
-            "UPDATE tracks SET chosen = ?, status = ?, error = NULL WHERE id = ?",
-            (_dump_meta(meta), TrackStatus.DOWNLOADING.value, track_id),
-        )
+        with self._write_lock:
+            self._conn.execute(
+                "UPDATE tracks SET chosen = ?, status = ?, error = NULL WHERE id = ?",
+                (_dump_meta(meta), TrackStatus.DOWNLOADING.value, track_id),
+            )
 
     def set_status(self, track_id: int, status: TrackStatus, error: str | None = None) -> None:
-        self._conn.execute(
-            "UPDATE tracks SET status = ?, error = ? WHERE id = ?",
-            (status.value, error, track_id),
-        )
+        with self._write_lock:
+            self._conn.execute(
+                "UPDATE tracks SET status = ?, error = ? WHERE id = ?",
+                (status.value, error, track_id),
+            )
 
     # --- 讀取 ---
 
