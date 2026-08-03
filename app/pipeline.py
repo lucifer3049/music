@@ -9,7 +9,8 @@
 介面說明（Task 5–9 實作期間與原計畫書落差，記錄於此避免下次重蹈覆轍）：
   - KKBOX 來源已於計畫中途放棄（AWS WAF 擋爬蟲），metadata 一律來自 MusicBrainz。
   - youtube.probe() 在整批曲目都拿不到時拋 ProbeError（而非回傳 []）；
-    這屬於「job 層級」失敗，不是單一 track 層級 —— 詳見 _record_probe_failure。
+    這屬於「job 層級」失敗，不是單一 track 層級 —— 記錄在 jobs.error 欄位
+    （見 JobStore.set_job_error），不再用佔位 track（Task 10 review Finding 3）。
   - musicbrainz.search() 依約定不會拋例外（任何失敗都內部吞掉回傳 []），
     這裡故意不包 try/except，避免把注入的測試替身（或未來真正的臭蟲）也一併吞掉。
   - Cover Art Archive 沒有契約保證一定回 JPEG，而 tagging.writer 寫入 m4a 封面時
@@ -28,7 +29,7 @@ from app.matching.matcher import rank_candidates, split_title
 from app.models import Candidate, SourceTrack, TrackMeta
 from app.sources import musicbrainz, youtube
 from app.storage.layout import build_paths
-from app.tagging.writer import write_tags
+from app.tagging.writer import UnsupportedFormatError, write_tags
 
 _JPEG_MAGIC = b"\xff\xd8"
 
@@ -89,15 +90,15 @@ class Pipeline:
         """探測網址並為每首曲目產生候選標籤。回傳 job id。
 
         probe 整批失敗（下架、私人、地區限制、網址不支援）時，不能無聲返回一個
-        空 job —— 使用者需要知道原因才能決定要不要重試。schema 沒有獨立的 job
-        層級狀態欄位，因此用一筆佔位 track 記錄失敗訊息（見 _record_probe_failure）。
+        空 job —— 使用者需要知道原因才能決定要不要重試。失敗訊息記錄在
+        jobs.error 欄位（見 JobStore.set_job_error），job.tracks 維持空陣列。
         其餘非預期例外（真正的臭蟲）原樣冒出，不偽裝成「已記錄的失敗」。
         """
         job_id = self.store.create_job(url)
         try:
             sources = self._probe_fn(url)
         except (youtube.ProbeError, youtube.UnsupportedUrlError) as exc:
-            self._record_probe_failure(job_id, url, exc)
+            self.store.set_job_error(job_id, str(exc))
             return job_id
 
         with self._client_factory() as client:
@@ -105,29 +106,17 @@ class Pipeline:
                 self._process_source(job_id, source, client)
         return job_id
 
-    def _record_probe_failure(
-        self, job_id: int, url: str, exc: Exception
-    ) -> None:
-        placeholder = SourceTrack(
-            video_id="",
-            url=url,
-            raw_title="",
-            duration=None,
-            artist=None,
-            track=None,
-            album=None,
-            release_year=None,
-        )
-        track_id = self.store.add_track(job_id, placeholder)
-        self.store.set_status(track_id, TrackStatus.FAILED, error=str(exc))
-
     def _process_source(self, job_id: int, source: SourceTrack, client) -> None:
         """一首曲目探測成功之後的後續處理：判重複／比對，失敗只記錄不外拋。
 
         單一曲目比對失敗不該連累同批其餘曲目 —— 這裡把例外攔下、記成該曲目
         FAILED，讓 submit() 的迴圈能繼續處理下一首。
+
+        判重複只看先前是否有同一 video_id 且已成功完成（DONE）的紀錄；FAILED
+        或其他未完成狀態不算重複 —— 否則失敗曲目重試時會被自己的舊紀錄擋住，
+        永遠無法再次下載（Task 10 review Finding 1）。
         """
-        if self.store.find_by_video_id(source.video_id):
+        if any(r.status == TrackStatus.DONE for r in self.store.find_by_video_id(source.video_id)):
             track_id = self.store.add_track(job_id, source)
             self.store.set_status(track_id, TrackStatus.SKIPPED, error="已存在，跳過")
             return
@@ -167,20 +156,31 @@ class Pipeline:
 
             self.store.set_status(track_id, TrackStatus.TAGGING)
             cover = self._fetch_cover(meta)
+            # 先在 workdir 就地標籤，成功了才搬進 Music/Archive —— 檔案只有
+            # 「完整標籤過」才能進圖書館；標籤失敗絕不能留下未標記、但檔名／
+            # 路徑看起來完全正常的檔案在使用者的真實收藏裡（Task 10 review
+            # Finding 2）。
+            self._write_fn(streams.m4a, meta, cover)
+            self._write_fn(streams.opus, meta, cover)
+
             paths = build_paths(self.roots, meta)
             paths.m4a.parent.mkdir(parents=True, exist_ok=True)
             paths.opus.parent.mkdir(parents=True, exist_ok=True)
-
             shutil.move(str(streams.m4a), paths.m4a)
             shutil.move(str(streams.opus), paths.opus)
-            self._write_fn(paths.m4a, meta, cover)
-            self._write_fn(paths.opus, meta, cover)
             if cover and not paths.cover.exists():
                 paths.cover.write_bytes(cover)
 
             self.store.set_status(track_id, TrackStatus.DONE)
-        except Exception as exc:
+        except (youtube.DownloadError, UnsupportedFormatError, OSError) as exc:
             self.store.set_status(track_id, TrackStatus.FAILED, error=str(exc))
+        except Exception as exc:
+            # 非預期的內部錯誤（例如程式邏輯本身的臭蟲）跟「下載／標籤失敗」
+            # 分開標記，避免使用者把真正的程式錯誤誤讀成單純下載失敗、重試無效
+            # 卻不知道要回報問題。
+            self.store.set_status(
+                track_id, TrackStatus.FAILED, error=f"未預期的內部錯誤：{exc}"
+            )
 
     def _fetch_cover(self, meta: TrackMeta) -> bytes | None:
         """封面失敗不算致命錯誤 —— 沒圖的歌還是要能收藏。

@@ -20,7 +20,8 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     url        TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    error      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS tracks (
@@ -68,6 +69,7 @@ class JobRow:
     url: str
     created_at: str
     tracks: list[TrackRow]
+    error: str | None
 
 
 def _meta_from_dict(data: dict) -> TrackMeta:
@@ -157,6 +159,18 @@ class JobStore:
                 (status.value, error, track_id),
             )
 
+    def set_job_error(self, job_id: int, message: str) -> None:
+        """記錄 job 層級失敗（探測整批拿不到任何曲目時）。
+
+        取代舊有的佔位 track 做法：這是 job 本身的失敗，不對應任何真實曲目，
+        `job.tracks` 因此維持空陣列，不會混進一筆 video_id="" 的假記錄。
+        """
+        with self._write_lock:
+            self._conn.execute(
+                "UPDATE jobs SET error = ? WHERE id = ?",
+                (message, job_id),
+            )
+
     # --- 讀取 ---
 
     def _row_to_track(self, row: sqlite3.Row) -> TrackRow:
@@ -192,6 +206,7 @@ class JobStore:
             url=job["url"],
             created_at=job["created_at"],
             tracks=[self._row_to_track(r) for r in rows],
+            error=job["error"],
         )
 
     def list_jobs(self) -> list[JobRow]:

@@ -124,6 +124,27 @@ def test_get_job_missing_returns_none(store):
     assert store.get_job(99999) is None
 
 
+def test_job_error_defaults_to_none(store):
+    job_id = store.create_job("u")
+    assert store.get_job(job_id).error is None
+
+
+def test_set_job_error_persists(store):
+    job_id = store.create_job("u")
+    store.set_job_error(job_id, "無法取得任何曲目：影片已下架")
+    job = store.get_job(job_id)
+    assert job.error == "無法取得任何曲目：影片已下架"
+    assert job.tracks == []
+
+
+def test_set_job_error_visible_via_list_jobs(store):
+    job_id = store.create_job("u")
+    store.set_job_error(job_id, "不支援的網址")
+    jobs = store.list_jobs()
+    assert jobs[0].id == job_id
+    assert jobs[0].error == "不支援的網址"
+
+
 def test_schema_is_idempotent(tmp_path):
     s = JobStore(tmp_path / "jobs.db")
     s.init_schema()

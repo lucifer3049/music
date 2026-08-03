@@ -117,18 +117,44 @@ def test_submit_falls_back_when_musicbrainz_empty(tmp_path, pipeline):
 
 
 def test_submit_skips_duplicate_video_id(pipeline):
-    pipeline.submit("https://music.youtube.com/watch?v=v1")
+    """只有先前已成功完成（DONE）的 video_id 才算重複；未完成的不算。"""
     job_id = pipeline.submit("https://music.youtube.com/watch?v=v1")
-    track = pipeline.store.get_job(job_id).tracks[0]
+    first_track = pipeline.store.get_job(job_id).tracks[0]
+    pipeline.store.confirm(first_track.id, _meta())
+    pipeline.finalize(first_track.id)
+    assert pipeline.store.get_track(first_track.id).status == TrackStatus.DONE
+
+    job_id2 = pipeline.submit("https://music.youtube.com/watch?v=v1")
+    track = pipeline.store.get_job(job_id2).tracks[0]
     assert track.status == TrackStatus.SKIPPED
+
+
+def test_submit_does_not_skip_after_failed_download(pipeline):
+    """FAILED 的舊紀錄不能擋住重試 —— 使用者重新送出同一個網址時，
+    新的一筆必須能正常走到 AWAITING_CONFIRM，而不是被誤判成「已存在」。"""
+    job_id = pipeline.submit("https://music.youtube.com/watch?v=v1")
+    first_track = pipeline.store.get_job(job_id).tracks[0]
+    pipeline.store.confirm(first_track.id, _meta())
+
+    def boom(video_id, workdir, **kwargs):
+        raise RuntimeError("網路斷了")
+
+    pipeline._download_fn = boom
+    pipeline.finalize(first_track.id)
+    assert pipeline.store.get_track(first_track.id).status == TrackStatus.FAILED
+
+    job_id2 = pipeline.submit("https://music.youtube.com/watch?v=v1")
+    track = pipeline.store.get_job(job_id2).tracks[0]
+    assert track.status != TrackStatus.SKIPPED
+    assert track.status == TrackStatus.AWAITING_CONFIRM
 
 
 def test_submit_persists_probe_error_message(pipeline):
     """ProbeError（下架／私人／地區限制）必須被記錄，不能無聲吞掉。
 
-    這是 job 層級的失敗（probe 連一首曲目都拿不到），schema 沒有獨立的
-    job.status 欄位，所以用一筆佔位 track（video_id=""）記錄，讓 UI 能從
-    job.tracks 看到失敗原因，也讓使用者知道可以重新貼網址重試。
+    這是 job 層級的失敗（probe 連一首曲目都拿不到），記錄在 jobs.error 欄位，
+    不再用佔位 track —— job.tracks 保持空陣列，不會混進一筆不對應真實曲目的
+    假記錄。
     """
 
     def boom(url):
@@ -138,11 +164,9 @@ def test_submit_persists_probe_error_message(pipeline):
     job_id = pipeline.submit("https://music.youtube.com/watch?v=v1")
     job = pipeline.store.get_job(job_id)
 
-    assert len(job.tracks) == 1
-    track = job.tracks[0]
-    assert track.status == TrackStatus.FAILED
-    assert track.error is not None
-    assert "這部影片不存在" in track.error
+    assert job.tracks == []
+    assert job.error is not None
+    assert "這部影片不存在" in job.error
 
 
 def test_submit_persists_unsupported_url_message(pipeline):
@@ -156,9 +180,9 @@ def test_submit_persists_unsupported_url_message(pipeline):
     job_id = pipeline.submit("https://example.com/not-youtube")
     job = pipeline.store.get_job(job_id)
 
-    assert len(job.tracks) == 1
-    assert job.tracks[0].status == TrackStatus.FAILED
-    assert "不支援的網址" in job.tracks[0].error
+    assert job.tracks == []
+    assert job.error is not None
+    assert "不支援的網址" in job.error
 
 
 def test_submit_propagates_unexpected_probe_exception(pipeline):
@@ -260,6 +284,29 @@ def test_finalize_skips_non_jpeg_cover(pipeline):
     final = pipeline.store.get_track(track.id)
     assert final.status == TrackStatus.DONE
     assert all(cover is None for _, _, cover in pipeline.written)
+
+
+def test_finalize_leaves_library_untouched_when_tagging_fails(pipeline, tmp_path):
+    """標籤寫入必須發生在檔案還在 workdir 的時候，寫失敗就不能把未標記的檔案
+    留在真正的 Music/Archive 目錄裡 —— 那樣從資料夾看會跟正常下載完全分不出來。"""
+    job_id = pipeline.submit("https://music.youtube.com/watch?v=v1")
+    track = pipeline.store.get_job(job_id).tracks[0]
+    pipeline.store.confirm(track.id, _meta())
+
+    def boom(path, meta, cover=None):
+        raise RuntimeError("tag 寫入壞掉")
+
+    pipeline._write_fn = boom
+    pipeline.finalize(track.id)
+
+    final = pipeline.store.get_track(track.id)
+    assert final.status == TrackStatus.FAILED
+
+    def _files(root):
+        return list(root.rglob("*")) if root.exists() else []
+
+    assert _files(tmp_path / "Music") == []
+    assert _files(tmp_path / "Archive") == []
 
 
 def test_finalize_skips_cover_when_no_cover_url(pipeline):
