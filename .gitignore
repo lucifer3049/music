@@ -6,3 +6,7 @@ __pycache__/
 jobs.db
 downloads/
 .superpowers/
+_devlib/
+.claude/serve.ps1
+jobs.db-shm
+jobs.db-wal
