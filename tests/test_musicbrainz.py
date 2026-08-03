@@ -1,10 +1,13 @@
 import json
+import threading
+import time
 from pathlib import Path
 
 import httpx
 import pytest
 
 from app.models import TrackMeta
+from app.sources import musicbrainz
 from app.sources.musicbrainz import (
     MusicBrainzError,
     cover_url_for_release,
@@ -16,6 +19,17 @@ from app.sources.musicbrainz import (
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+@pytest.fixture(autouse=True)
+def _reset_throttle():
+    """重置模組級節流器狀態，避免與節流無關的測試因共用 _last_request_at 真的 sleep。
+
+    test_search_recordings_throttles_concurrent_calls 需要量測真實節流延遲，
+    因此會在測試內自行明確設定 _last_request_at，不依賴這裡的重置。
+    """
+    musicbrainz._last_request_at = time.monotonic() - 3600
+    yield
 
 # 依 Step 1 實際擷取到的內容填寫（tests/fixtures/mb_recording_search.json）
 EXPECTED_TITLE = "Bohemian Rhapsody"
@@ -168,6 +182,63 @@ def test_search_skips_unparseable_recording_but_keeps_others():
         results = search("任何字串", client=client)
 
     assert [m.title for m in results] == [EXPECTED_TITLE]
+
+
+def test_search_returns_empty_on_non_dict_payload():
+    """MusicBrainz 回了 200 但 body 不是物件時不得拋出 —— Task 10 靠這個降級。"""
+    with httpx.Client(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json=[1, 2, 3]))
+    ) as client:
+        assert search("任何字串", client=client) == []
+
+
+def test_search_skips_non_dict_recording_entries():
+    payload = {"recordings": ["not-a-dict", None, 42]}
+    with httpx.Client(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json=payload))
+    ) as client:
+        assert search("任何字串", client=client) == []
+
+
+def test_search_recordings_throttles_concurrent_calls():
+    """Pipeline 用執行緒池平行下載，兩條執行緒同時呼叫 search_recordings 時
+    節流仍必須生效，不得因為 _last_request_at 的更新移到鎖外而失效。
+
+    用 Barrier 逼兩條執行緒在同一瞬間一起進入 _throttle()，製造真正的競爭
+    窗口 —— 否則其中一條執行緒可能在另一條開始讀取前就整個跑完，race 就
+    測不出來。
+    """
+    call_times: list[float] = []
+    times_lock = threading.Lock()
+    start_barrier = threading.Barrier(2)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        with times_lock:
+            call_times.append(time.monotonic())
+        return httpx.Response(200, json=_fixture("mb_recording_search.json"))
+
+    def worker(client: httpx.Client) -> None:
+        start_barrier.wait()
+        search_recordings("query", client=client)
+
+    # 明確設定節流器狀態（不依賴 autouse fixture 的重置）：故意設成「剛剛才
+    # 打過」，讓兩條執行緒都需要真的 sleep。time.sleep() 會釋放 GIL，這正是
+    # 「sleep 若移到鎖外」會讓另一條執行緒趁隙插進來同時 sleep、同時起跑的
+    # 破綻所在 —— 只設定成很久以前的話，第一條執行緒不需要 sleep 就會整個
+    # 跑完，兩條執行緒沒有真正的競爭窗口，測不出這個 race。
+    musicbrainz._last_request_at = time.monotonic()
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        threads = [threading.Thread(target=worker, args=(client,)) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    assert len(call_times) == 2
+    call_times.sort()
+    gap = call_times[1] - call_times[0]
+    assert gap >= musicbrainz.MIN_REQUEST_INTERVAL_SECONDS - 0.05
 
 
 def test_fetch_cover_returns_bytes():

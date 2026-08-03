@@ -190,6 +190,8 @@ def search_recordings(
     )
     response.raise_for_status()
     payload = response.json()
+    if not isinstance(payload, dict):
+        raise MusicBrainzError("回應不是預期的物件結構")
     recordings = payload.get("recordings")
     if not isinstance(recordings, list):
         raise MusicBrainzError("回應缺少 recordings 陣列")
@@ -204,14 +206,16 @@ def search(query: str, *, client: httpx.Client) -> list[TrackMeta]:
     """
     try:
         recordings = search_recordings(query, client=client)
-    except (httpx.HTTPError, MusicBrainzError, ValueError):
+    except (httpx.HTTPError, MusicBrainzError, ValueError, AttributeError):
         return []
 
     results: list[TrackMeta] = []
     for recording in recordings:
+        if not isinstance(recording, dict):
+            continue
         try:
             results.append(to_track_meta(recording))
-        except (MusicBrainzError, KeyError, TypeError):
+        except (MusicBrainzError, KeyError, TypeError, AttributeError):
             continue
     return results
 
