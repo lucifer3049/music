@@ -8,7 +8,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from app.api.routes import create_app
+from app.api.routes import SubmitRequest, create_app
 from app.config import LibraryRoots
 from app.jobs.store import JobStore, TrackStatus
 from app.models import SourceTrack, TrackMeta
@@ -185,6 +185,71 @@ async def test_skip_404(client):
     assert (await client.post("/api/tracks/99999/skip")).status_code == 404
 
 
+# --- confirm/skip 必須檢查曲目目前狀態（見任務說明：已在 DOWNLOADING／DONE
+#     的曲目若能再次被 confirm，會產生第二個 finalize 背景工作，兩邊搶著寫
+#     同一組目的地路徑）---
+
+
+async def test_confirm_rejects_already_done_track(client, app_and_pipeline):
+    _, pipeline = app_and_pipeline
+    job_id = (await client.post(
+        "/api/jobs", json={"urls": ["https://music.youtube.com/watch?v=v1"]}
+    )).json()["job_ids"][0]
+    track_id = pipeline.store.get_job(job_id).tracks[0].id
+    await client.post(f"/api/tracks/{track_id}/confirm", json={"meta": META_PAYLOAD})
+    await _wait_for(pipeline, track_id, TrackStatus.DONE)
+
+    response = await client.post(f"/api/tracks/{track_id}/confirm", json={"meta": META_PAYLOAD})
+    assert response.status_code == 409
+    assert TrackStatus.DONE.value in response.json()["detail"]
+
+
+async def test_confirm_rejects_track_already_downloading(tmp_path):
+    """卡住 finalize，確定性地讓 track 停在 DOWNLOADING，驗證第二次 confirm
+    會被擋下（而不是又排一個背景工作出來跟第一個搶著寫同一組檔案路徑）。"""
+    gate = threading.Event()
+
+    def gated_download(video_id, workdir, **kwargs):
+        gate.wait(timeout=5)
+        return _fake_download(video_id, workdir, **kwargs)
+
+    pipeline = _build_pipeline(tmp_path, download_fn=gated_download)
+    app = create_app(pipeline)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        job_id = (await c.post(
+            "/api/jobs", json={"urls": ["https://music.youtube.com/watch?v=v1"]}
+        )).json()["job_ids"][0]
+        track_id = pipeline.store.get_job(job_id).tracks[0].id
+
+        first = await c.post(f"/api/tracks/{track_id}/confirm", json={"meta": META_PAYLOAD})
+        assert first.status_code == 200
+        assert pipeline.store.get_track(track_id).status == TrackStatus.DOWNLOADING
+
+        second = await c.post(f"/api/tracks/{track_id}/confirm", json={"meta": META_PAYLOAD})
+        assert second.status_code == 409
+        assert TrackStatus.DOWNLOADING.value in second.json()["detail"]
+
+        gate.set()
+        await _wait_for(pipeline, track_id, TrackStatus.DONE)
+        await asyncio.sleep(0)  # 讓 done_callback 有機會跑，避免懸掛的背景 task
+    pipeline.store.close()
+
+
+async def test_skip_rejects_already_done_track(client, app_and_pipeline):
+    _, pipeline = app_and_pipeline
+    job_id = (await client.post(
+        "/api/jobs", json={"urls": ["https://music.youtube.com/watch?v=v1"]}
+    )).json()["job_ids"][0]
+    track_id = pipeline.store.get_job(job_id).tracks[0].id
+    await client.post(f"/api/tracks/{track_id}/confirm", json={"meta": META_PAYLOAD})
+    await _wait_for(pipeline, track_id, TrackStatus.DONE)
+
+    response = await client.post(f"/api/tracks/{track_id}/skip")
+    assert response.status_code == 409
+    assert TrackStatus.DONE.value in response.json()["detail"]
+
+
 # --- job 層級錯誤（Task 10 之後 probe 整批失敗記錄在 jobs.error，tracks 維持空陣列）---
 
 
@@ -237,6 +302,110 @@ async def test_events_stream_terminates_for_job_with_no_tracks(tmp_path):
     assert events
     payload = json.loads(events[-1][len("data: "):])
     assert payload["tracks"] == []
+    pipeline.store.close()
+
+
+def _endpoint(app: FastAPI, path: str):
+    """依路徑找出路由函式本體（繞過 ASGI 傳輸層直接呼叫用）。"""
+    for route in app.routes:
+        if getattr(route, "path", None) == path:
+            return route.endpoint
+    raise AssertionError(f"找不到路由 {path}")
+
+
+async def test_events_stream_survives_population_window_then_reports_terminal(
+    tmp_path, monkeypatch
+):
+    """job 建立後、submit() 還卡在 probe_fn 裡時（tracks 仍是空陣列、
+    job.error 也還是 None），SSE 不能把這個「還在填充中」的窗口誤判成
+    「job 層級探測失敗、永遠不會再有新曲目」而提早關閉串流。
+
+    JobStore 是 autocommit（isolation_level=None），create_job() 一提交就對
+    外可見，早於 probe_fn 與逐曲 add_track 執行；POST /api/jobs 把 submit()
+    丟給 asyncio.to_thread，整個 probe + 逐曲比對期間事件迴圈是空的，此時
+    另一個請求打開 SSE 觀察到的 job.tracks == [] 和「job 層級失敗」在表面上
+    無法區分——區分依據是 job.error 是否為 None。用 threading.Event 卡住
+    probe_fn，確定性地打開這個窗口。
+
+    注意：httpx.ASGITransport.handle_async_request 會把整個 ASGI 呼叫（含
+    StreamingResponse 產生器整段跑完）buffer 完才回傳 Response 物件給
+    client（見 httpx/_transports/asgi.py：`await self.app(...)` 完全結束
+    後才組出 Response），沒辦法拿來觀察「串流在另一個請求還卡住時是否仍
+    活著」這種真正的漸進式時序——用 client.stream() 讀到第一行之前，
+    generator 早就把整段（含最終的 break）跑完了。因此這裡直接呼叫路由
+    函式本體、逐塊消費 StreamingResponse.body_iterator（就是 routes.py
+    裡那個 async generator 本尊），取得未被 buffer 的真實時序；confirm／
+    skip 這類非串流端點沒有這個問題，一樣直接呼叫路由函式，語意等同經過
+    HTTP 層。
+    """
+    monkeypatch.setattr("app.api.routes.SSE_INTERVAL_SECONDS", 0.05)
+
+    probe_started = threading.Event()
+    probe_gate = threading.Event()
+
+    def gated_probe(url):
+        probe_started.set()
+        assert probe_gate.wait(timeout=5), "probe_gate 逾時未被釋放"
+        return [_source()]
+
+    pipeline = _build_pipeline(tmp_path, probe_fn=gated_probe)
+    app = create_app(pipeline)
+    submit_jobs = _endpoint(app, "/api/jobs")
+    job_events = _endpoint(app, "/api/jobs/{job_id}/events")
+    skip_track = _endpoint(app, "/api/tracks/{track_id}/skip")
+
+    async def _run():
+        submit_task = asyncio.create_task(
+            submit_jobs(SubmitRequest(urls=["https://music.youtube.com/watch?v=v1"]))
+        )
+
+        for _ in range(200):
+            if probe_started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("probe_fn 沒有在時限內被呼叫")
+
+        jobs = pipeline.store.list_jobs()
+        assert len(jobs) == 1
+        job_id = jobs[0].id
+        assert jobs[0].tracks == []
+        assert jobs[0].error is None
+
+        response = await job_events(job_id)
+        assert response.status_code == 200
+
+        events: list[dict] = []
+        skip_sent = False
+        async for chunk in response.body_iterator:
+            text = chunk if isinstance(chunk, str) else chunk.decode("utf-8")
+            for line in text.splitlines():
+                if not line.startswith("data:"):
+                    continue
+                payload = json.loads(line[len("data: "):])
+                events.append(payload)
+
+                if len(events) == 2:
+                    # 串流在填充窗口期間至少撐過兩輪、沒有被空陣列誤判提早
+                    # 結束——這正是本測試要證明的行為。現在才放行 probe，
+                    # 讓 submit() 補上曲目。
+                    probe_gate.set()
+                elif payload["tracks"] and not skip_sent:
+                    skip_sent = True
+                    track_id = payload["tracks"][0]["id"]
+                    skip_result = await skip_track(track_id)
+                    assert skip_result["status"] == TrackStatus.SKIPPED.value
+
+        submit_result = await submit_task
+        assert submit_result["job_ids"] == [job_id]
+        return events
+
+    events = await asyncio.wait_for(_run(), timeout=8.0)
+
+    assert len(events) >= 3
+    assert events[0]["tracks"] == []
+    assert events[1]["tracks"] == []
+    assert events[-1]["tracks"][0]["status"] == TrackStatus.SKIPPED.value
     pipeline.store.close()
 
 

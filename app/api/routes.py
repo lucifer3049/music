@@ -142,8 +142,18 @@ def create_app(pipeline: Pipeline) -> FastAPI:
 
     @app.post("/api/tracks/{track_id}/confirm")
     async def confirm_track(track_id: int, request: ConfirmRequest) -> dict:
-        if pipeline.store.get_track(track_id) is None:
+        track = pipeline.store.get_track(track_id)
+        if track is None:
             raise HTTPException(status_code=404, detail="找不到曲目")
+        # 只有 AWAITING_CONFIRM 能被確認：已在 DOWNLOADING／TAGGING／DONE／
+        # SKIPPED 的曲目若能再次 confirm，會排出第二個 finalize 背景工作，
+        # 跟原本進行中（或已完成）的那個搶著寫同一組目的地路徑（Task 11
+        # review Finding 2）。
+        if track.status != TrackStatus.AWAITING_CONFIRM:
+            raise HTTPException(
+                status_code=409,
+                detail=f"曲目目前狀態為 {track.status.value}，無法確認",
+            )
         pipeline.store.confirm(track_id, request.meta.to_meta())
         # 下載在背景跑，立刻回應讓前端可以繼續確認下一首。
         task = asyncio.create_task(asyncio.to_thread(pipeline.finalize, track_id))
@@ -153,8 +163,14 @@ def create_app(pipeline: Pipeline) -> FastAPI:
 
     @app.post("/api/tracks/{track_id}/skip")
     async def skip_track(track_id: int) -> dict:
-        if pipeline.store.get_track(track_id) is None:
+        track = pipeline.store.get_track(track_id)
+        if track is None:
             raise HTTPException(status_code=404, detail="找不到曲目")
+        if track.status != TrackStatus.AWAITING_CONFIRM:
+            raise HTTPException(
+                status_code=409,
+                detail=f"曲目目前狀態為 {track.status.value}，無法跳過",
+            )
         pipeline.store.set_status(track_id, TrackStatus.SKIPPED)
         return {"status": TrackStatus.SKIPPED.value}
 
@@ -170,11 +186,22 @@ def create_app(pipeline: Pipeline) -> FastAPI:
                     break
                 payload = json.dumps(_job_dict(job), ensure_ascii=False)
                 yield f"data: {payload}\n\n"
-                # all() 對空陣列回傳 True：job 層級探測失敗時 job.tracks 是空
-                # 陣列（見 app/pipeline.py），這種 job 不會再有新曲目加入，必須
-                # 在第一輪就結束串流，否則會無窮迴圈卡住（原簡報參考碼多了
-                # `job.tracks and` 這個 guard，反而讓空陣列的情況永遠不會終止）。
-                if all(t.status in TERMINAL_STATUSES for t in job.tracks):
+                # job.tracks == [] 是兩種完全不同情況共同的表面現象，光看
+                # tracks 分不出來：
+                #   (a) job 層級探測整批失敗（見 app/pipeline.py 的
+                #       Pipeline.submit）——不會再有新曲目加入，必須結束串流；
+                #   (b) submit() 還在跑（JobStore 是 autocommit，create_job()
+                #       一提交就對外可見，早於 probe_fn 與逐曲 add_track），
+                #       tracks 之後就會補上，此時絕不能提早結束。
+                # 用 job.error 區分兩者：只有 (a) 會把它設成非 None（見
+                # JobStore.set_job_error）。若只看 `all(t.status in
+                # TERMINAL for t in job.tracks)`，空陣列會讓 all() 對空陣列
+                # 回傳 True，把 (b) 誤判成 (a) 而提早關閉串流（Task 11 review
+                # Finding 1）。`job.tracks and ...` 這段則反過來確保 tracks
+                # 非空時才用「全部曲目終結」判斷是否結束。
+                if job.error is not None or (
+                    job.tracks and all(t.status in TERMINAL_STATUSES for t in job.tracks)
+                ):
                     break
                 await asyncio.sleep(SSE_INTERVAL_SECONDS)
 
