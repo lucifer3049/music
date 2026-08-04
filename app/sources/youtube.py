@@ -109,13 +109,20 @@ class _CollectingLogger:
 
 
 def probe(url: str, *, ydl_factory=_default_ydl_factory) -> list[SourceTrack]:
-    """只抽 metadata，不下載任何音訊。回傳順序即專輯／清單順序。"""
-    classify_url(url)  # 先驗證，網址不合法就別浪費一次網路來回
+    """只抽 metadata，不下載任何音訊。回傳順序即專輯／清單順序。
+
+    分類結果必須傳給 yt-dlp。從 YouTube Music 複製單曲網址時，通常會夾帶整張
+    專輯的 `&list=OLAK5uy_...`；classify_url() 判定為 SINGLE，但若不設
+    noplaylist，yt-dlp 仍會展開整張清單並逐首抓完整 metadata。實測 39 首的
+    專輯：39.6 秒 vs 1.8 秒，之後每首還各要一次受節流的 MusicBrainz 查詢。
+    """
+    kind = classify_url(url)  # 先驗證，網址不合法就別浪費一次網路來回
     logger = _CollectingLogger()
     opts = {
         "skip_download": True,
         "extract_flat": False,
         "ignoreerrors": True,
+        "noplaylist": kind is UrlKind.SINGLE,
         "logger": logger,
     }
     with ydl_factory(opts) as ydl:

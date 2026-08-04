@@ -11,3 +11,4 @@ _devlib/
 jobs.db-shm
 jobs.db-wal
 settings.local.cmd
+logs/

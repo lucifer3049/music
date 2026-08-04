@@ -157,3 +157,51 @@ def test_probe_error_carries_ytdlp_message():
 
     with pytest.raises(ProbeError, match="private"):
         probe("https://music.youtube.com/watch?v=gone", ydl_factory=_LoggingYDL)
+
+
+class _OptsCapturingYDL:
+    """記下 probe() 實際交給 yt-dlp 的 opts。"""
+
+    captured: dict = {}
+
+    def __init__(self, opts):
+        type(self).captured = opts
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def extract_info(self, url, download=False):
+        return {"id": "abc", "title": "某歌", "duration": 100}
+
+
+def test_probe_sets_noplaylist_for_single_url_carrying_a_list_id():
+    """從 YouTube Music 複製單曲網址會夾帶 &list=OLAK5uy_...。
+
+    不設 noplaylist 的話 yt-dlp 會展開整張專輯逐首抓 metadata：實測 39 首的
+    專輯要 39.6 秒，而不是 1.8 秒。
+    """
+    probe(
+        "https://music.youtube.com/watch?v=abc&list=OLAK5uy_x",
+        ydl_factory=_OptsCapturingYDL,
+    )
+    assert _OptsCapturingYDL.captured["noplaylist"] is True
+
+
+def test_probe_does_not_set_noplaylist_for_album_url():
+    """專輯網址就是要整張，不能把清單關掉。"""
+    probe(
+        "https://music.youtube.com/playlist?list=OLAK5uy_x",
+        ydl_factory=_OptsCapturingYDL,
+    )
+    assert _OptsCapturingYDL.captured["noplaylist"] is False
+
+
+def test_probe_does_not_set_noplaylist_for_playlist_url():
+    probe(
+        "https://music.youtube.com/playlist?list=PLabc",
+        ydl_factory=_OptsCapturingYDL,
+    )
+    assert _OptsCapturingYDL.captured["noplaylist"] is False

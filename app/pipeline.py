@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import logging
 import shutil
 from dataclasses import replace
 from pathlib import Path
@@ -35,6 +36,8 @@ from app.storage.layout import build_paths
 from app.tagging.writer import UnsupportedFormatError, write_tags
 
 _JPEG_MAGIC = b"\xff\xd8"
+
+logger = logging.getLogger(__name__)
 
 
 def fallback_meta(source: SourceTrack) -> TrackMeta:
@@ -105,15 +108,24 @@ class Pipeline:
         其餘非預期例外（真正的臭蟲）原樣冒出，不偽裝成「已記錄的失敗」。
         """
         job_id = self.store.create_job(url)
+        logger.info("job %s 探測開始：%s", job_id, url)
         try:
             sources = self._probe_fn(url)
         except (youtube.ProbeError, youtube.UnsupportedUrlError) as exc:
+            logger.warning("job %s 探測失敗：%s", job_id, exc)
             self.store.set_job_error(job_id, str(exc))
             return job_id
 
+        # 每首都要一次受節流的 MusicBrainz 查詢，所以曲數直接決定這段要等多久。
+        # 使用者盯著「探測中」時最想知道的就是這個數字。
+        logger.info("job %s 探測到 %s 首，開始逐首比對 metadata", job_id, len(sources))
         with self._client_factory() as client:
-            for source in sources:
+            for index, source in enumerate(sources, start=1):
+                logger.info(
+                    "job %s 比對 %s/%s：%s", job_id, index, len(sources), source.raw_title
+                )
                 self._process_source(job_id, source, client)
+        logger.info("job %s 比對完成，等待使用者確認", job_id)
         return job_id
 
     def _process_source(self, job_id: int, source: SourceTrack, client) -> None:
@@ -212,12 +224,16 @@ class Pipeline:
                 paths.cover.write_bytes(cover)
 
             self.store.set_status(track_id, TrackStatus.DONE)
+            logger.info("曲目 %s 完成：%s", track_id, paths.m4a)
         except (youtube.DownloadError, UnsupportedFormatError, mutagen.MutagenError, OSError) as exc:
+            logger.warning("曲目 %s 下載或標籤失敗：%s", track_id, exc)
             self.store.set_status(track_id, TrackStatus.FAILED, error=str(exc))
         except Exception as exc:
             # 非預期的內部錯誤（例如程式邏輯本身的臭蟲）跟「下載／標籤失敗」
             # 分開標記，避免使用者把真正的程式錯誤誤讀成單純下載失敗、重試無效
             # 卻不知道要回報問題。
+            # 這一條要帶完整 traceback：這是程式的錯，log 是唯一線索。
+            logger.exception("曲目 %s 發生未預期的內部錯誤", track_id)
             self.store.set_status(
                 track_id, TrackStatus.FAILED, error=f"未預期的內部錯誤：{exc}"
             )

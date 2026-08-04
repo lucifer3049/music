@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import logging
+import logging.handlers
 import os
 import shutil
 import socket
@@ -23,6 +25,11 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_PORT = 8899
 HOST = "127.0.0.1"
+LOG_DIR = PROJECT_ROOT / "logs"
+LOG_FILE = LOG_DIR / "app.log"
+# 保留最近幾份，避免長期使用把磁碟塞滿。
+LOG_MAX_BYTES = 2 * 1024 * 1024
+LOG_BACKUP_COUNT = 3
 # 埠被占用時最多往後找幾個。避免使用者已經開著一份卻看到一句冷冰冰的錯誤。
 PORT_SEARCH_RANGE = 10
 STARTUP_TIMEOUT_SECONDS = 60
@@ -38,6 +45,38 @@ _FFMPEG_SYSTEM_DIRS = (
     r"C:\ProgramData\chocolatey\bin",
     r"C:\ffmpeg\bin",
 )
+
+
+def setup_logging() -> None:
+    """同時寫主控台與 logs/app.log。
+
+    主控台視窗一關就什麼都不剩，但下載是長時間作業，出事時往往已經關掉了。
+    檔案輪替上限 2 MB × 4 份，長期使用不會塞爆磁碟。
+    """
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    file_handler = logging.handlers.RotatingFileHandler(
+        LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8"
+    )
+    file_handler.setFormatter(formatter)
+    file_handler.setLevel(logging.INFO)
+
+    console = logging.StreamHandler()
+    console.setFormatter(formatter)
+    console.setLevel(logging.INFO)
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.handlers.clear()
+    root.addHandler(file_handler)
+    root.addHandler(console)
+
+    # yt-dlp 每首歌會噴大量 debug，只留警告以上，否則 log 檔會被它淹掉。
+    logging.getLogger("yt_dlp").setLevel(logging.WARNING)
 
 
 def _die(message: str) -> None:
@@ -149,6 +188,7 @@ def main() -> None:
     os.chdir(PROJECT_ROOT)
     sys.path.insert(0, str(PROJECT_ROOT))
 
+    setup_logging()
     ensure_ffmpeg()
     _warn_missing_contact()
 
@@ -163,6 +203,7 @@ def main() -> None:
 
     print(f"音樂下載工具 — {url}")
     print("關閉這個視窗即停止伺服器。")
+    print(f"執行紀錄：{LOG_FILE}")
     print()
 
     threading.Thread(target=_open_browser_when_ready, args=(url, port), daemon=True).start()
@@ -170,7 +211,9 @@ def main() -> None:
     import uvicorn
 
     try:
-        uvicorn.run("app.main:app", host=HOST, port=port, log_level="warning")
+        # log_config=None 才不會讓 uvicorn 蓋掉 setup_logging() 裝好的 handler，
+        # 否則它的紀錄只會進主控台、不會落到檔案。
+        uvicorn.run("app.main:app", host=HOST, port=port, log_level="info", log_config=None)
     except KeyboardInterrupt:
         pass
     except Exception as exc:  # noqa: BLE001 — 最外層，要讓使用者看得到原因
