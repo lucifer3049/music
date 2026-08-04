@@ -1,0 +1,4 @@
+# cmd.exe mis-parses .bat/.cmd files that have LF line endings, splitting
+# lines mid-command. Force CRLF so a checkout can never break the launcher.
+*.bat text eol=crlf
+*.cmd text eol=crlf
