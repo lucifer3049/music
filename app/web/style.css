@@ -69,6 +69,30 @@ button:disabled { opacity: 0.4; cursor: default; }
 .candidate .score.high { color: seagreen; font-weight: 600; }
 .candidate .score.low { color: darkorange; }
 
+.edit-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 8px;
+  margin: var(--gap) 0;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.edit-fields legend { font-size: 0.8em; opacity: 0.7; padding: 0 4px; }
+.edit-fields label { display: flex; flex-direction: column; gap: 2px; font-size: 0.85em; }
+.edit-fields input {
+  font-family: inherit;
+  font-size: 1em;
+  padding: 4px 6px;
+  box-sizing: border-box;
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+}
+.edit-fields input:disabled { opacity: 0.5; }
+
 .actions { display: flex; gap: 8px; }
 
 .error, .action-error, .job-error {

@@ -26,9 +26,30 @@ const trackTemplate = document.getElementById("track-template");
 
 // track id -> 使用者目前選中的候選索引
 const selections = new Map();
+// track id -> 目前編輯表單內容（字串形式，直接對應 input.value）。
+// 選取候選時整包覆寫成該候選的內容；使用者在欄位裡打字時逐欄位更新。
+// renderTrack() 每次重繪都從這裡讀值回填，讓使用者的修改撐過下一次 SSE
+// 推播——否則後端每秒一次的整包重繪會把使用者還沒送出的修改蓋回候選原文。
+const edits = new Map();
 // job id -> 開啟中的 EventSource，避免刷新頁面或重複呼叫 watchJob 時
 // 對同一個 job 疊加多條串流連線。
 const openStreams = new Map();
+
+// 會寫進 MetaPayload 的可編輯欄位（見 app/api/routes.py）。刻意不含
+// cover_url／duration／source_url：cover_url 會被
+// app/sources/musicbrainz.py 的 release_mbid_for_genre_lookup() 反解出
+// release MBID 拿去查 genre，開放編輯等於讓使用者的任意字串在伺服器端
+// 被當成下載網址使用，因此這三欄一律原封不動從選中的候選帶過去。
+const EDITABLE_FIELDS = [
+  "title",
+  "artists",
+  "album_artist",
+  "album",
+  "year",
+  "track_no",
+  "track_total",
+  "genre",
+];
 
 submitBtn.addEventListener("click", async () => {
   const urls = urlsEl.value.split("\n").map((s) => s.trim()).filter(Boolean);
@@ -85,7 +106,28 @@ function renderJob(job) {
   section.querySelector(".job-error").textContent = job.error || "";
 
   const container = section.querySelector(".tracks");
-  container.replaceChildren(...job.tracks.map(renderTrack));
+  // 後端每秒不做內容比對地整包推 SSE payload，renderJob() 平常就整包
+  // replaceChildren() 換掉所有曲目節點。如果使用者正在某首曲目的編輯
+  // 表單裡打字，這個換節點的動作會連游標位置一起丟掉，而且一秒一次的
+  // 頻率讓使用者幾乎打不完一個字。與其在每次重繪後把 focus／caret 精準
+  // 搬回新節點，這裡直接讓「正在編輯中」的那首曲目節點原地保留、跳過這
+  // 一輪重繪；其餘曲目照常重繪。使用者放開該欄位（切去編輯別首、或按下
+  // 確認／跳過）之後，下一輪 SSE 自然會用最新資料把它接回來。
+  const editingTrackId = focusedEditTrackId(container);
+  const existingByTrackId = new Map();
+  container.querySelectorAll(".track").forEach((el) => {
+    existingByTrackId.set(el.dataset.trackId, el);
+  });
+  container.replaceChildren(
+    ...job.tracks.map((track) => {
+      const idStr = String(track.id);
+      if (idStr === editingTrackId) {
+        const existing = existingByTrackId.get(idStr);
+        if (existing) return existing;
+      }
+      return renderTrack(track);
+    })
+  );
 
   if (isJobFinished(job)) {
     // 後端 SSE 端點在這個條件下也會結束串流；這裡同步把追蹤表清掉，
@@ -93,6 +135,64 @@ function renderJob(job) {
     openStreams.get(job.id)?.close();
     openStreams.delete(job.id);
   }
+}
+
+// 給定容器，回傳目前 focus 停在其 .edit-fields input 裡的曲目 id
+// （dataset.trackId 的字串形式），沒有的話回傳 null。
+function focusedEditTrackId(container) {
+  const active = document.activeElement;
+  if (!active || !container.contains(active)) return null;
+  if (!active.matches(".edit-fields input")) return null;
+  const trackEl = active.closest(".track");
+  return trackEl ? trackEl.dataset.trackId : null;
+}
+
+// 候選的 meta（title/artists/.../genre）轉成編輯表單用的字串值。
+// artists 是後端的 list[str]，用 "; " 接成單一輸入框內容——與檔案標籤
+// 「參與演出者」欄位的顯示分隔號一致，回寫時再用同一個分隔號拆回陣列。
+function metaToEditValues(meta) {
+  return {
+    title: meta.title ?? "",
+    artists: (meta.artists ?? []).join("; "),
+    album_artist: meta.album_artist ?? "",
+    album: meta.album ?? "",
+    year: meta.year != null ? String(meta.year) : "",
+    track_no: meta.track_no != null ? String(meta.track_no) : "",
+    track_total: meta.track_total != null ? String(meta.track_total) : "",
+    genre: meta.genre ?? "",
+  };
+}
+
+// 數字欄位（year/track_no/track_total）：空字串要送 null，不能送 ""
+// 或 0——MetaPayload 這幾欄是 int | None，送空字串或非數字會 422。
+function numOrNull(value) {
+  const trimmed = (value ?? "").trim();
+  if (trimmed === "") return null;
+  const n = Number(trimmed);
+  return Number.isFinite(n) ? Math.trunc(n) : null;
+}
+
+// 把編輯表單的字串值 + 選中候選的 meta 合成要送給 /confirm 的 MetaPayload。
+// cover_url／duration／source_url 永遠原封不動取自 baseMeta，不理會表單
+// （表單裡本來就沒有這三欄的輸入框）。
+function buildMetaPayload(baseMeta, values) {
+  const genre = (values.genre ?? "").trim();
+  return {
+    title: (values.title ?? "").trim(),
+    artists: (values.artists ?? "")
+      .split(";")
+      .map((s) => s.trim())
+      .filter(Boolean),
+    album_artist: (values.album_artist ?? "").trim(),
+    album: (values.album ?? "").trim(),
+    year: numOrNull(values.year),
+    track_no: numOrNull(values.track_no),
+    track_total: numOrNull(values.track_total),
+    genre: genre === "" ? null : genre,
+    cover_url: baseMeta.cover_url,
+    duration: baseMeta.duration,
+    source_url: baseMeta.source_url,
+  };
 }
 
 function renderTrack(track) {
@@ -108,25 +208,58 @@ function renderTrack(track) {
   article.querySelector(".action-error").textContent = "";
 
   const candidatesEl = article.querySelector(".candidates");
-  const selected = selections.get(track.id) ?? 0;
+  const selectedIndex = selections.get(track.id) ?? 0;
   track.candidates.forEach((candidate, index) => {
-    candidatesEl.append(renderCandidate(track.id, candidate, index, index === selected));
+    candidatesEl.append(
+      renderCandidate(track.id, candidate, index, index === selectedIndex, article)
+    );
+  });
+
+  // 編輯欄位：有既有編輯內容（使用者打過字，或先前選過候選）就用那份；
+  // 否則從目前選中的候選帶初值。track.candidates 為空（探測失敗降級到
+  // 完全查無資料的極端情況）就留空白讓使用者從零開始填。
+  const editFieldsEl = article.querySelector(".edit-fields");
+  const fieldInputs = {};
+  EDITABLE_FIELDS.forEach((field) => {
+    fieldInputs[field] = editFieldsEl.querySelector(`[data-field="${field}"]`);
+  });
+
+  let values = edits.get(track.id);
+  if (!values) {
+    const selectedCandidate = track.candidates[selectedIndex];
+    values = selectedCandidate ? metaToEditValues(selectedCandidate.meta) : metaToEditValues({});
+    edits.set(track.id, values);
+  }
+  EDITABLE_FIELDS.forEach((field) => {
+    fieldInputs[field].value = values[field] ?? "";
+    fieldInputs[field].addEventListener("input", () => {
+      const current = edits.get(track.id) ?? {};
+      current[field] = fieldInputs[field].value;
+      edits.set(track.id, current);
+    });
   });
 
   const editable = track.status === "awaiting_confirm";
+  EDITABLE_FIELDS.forEach((field) => {
+    fieldInputs[field].disabled = !editable;
+  });
+
   const confirmBtn = article.querySelector(".confirm");
   const skipBtn = article.querySelector(".skip");
   confirmBtn.disabled = !editable || track.candidates.length === 0;
   skipBtn.disabled = !editable;
-  confirmBtn.addEventListener("click", () =>
-    confirmTrack(confirmBtn, track, selections.get(track.id) ?? 0)
-  );
+  confirmBtn.addEventListener("click", () => {
+    const baseCandidate = track.candidates[selections.get(track.id) ?? 0];
+    if (!baseCandidate) return;
+    const currentValues = edits.get(track.id) ?? values;
+    confirmTrack(confirmBtn, track.id, baseCandidate.meta, currentValues);
+  });
   skipBtn.addEventListener("click", () => skipTrack(skipBtn, track.id));
 
   return node;
 }
 
-function renderCandidate(trackId, candidate, index, isSelected) {
+function renderCandidate(trackId, candidate, index, isSelected, article) {
   const meta = candidate.meta;
   const div = document.createElement("div");
   div.className = "candidate" + (isSelected ? " selected" : "");
@@ -136,6 +269,17 @@ function renderCandidate(trackId, candidate, index, isSelected) {
       el.classList.remove("selected");
     });
     div.classList.add("selected");
+
+    // 換候選＝使用者要的是這個候選的內容，覆寫掉先前的編輯表單內容
+    // （通常是屬於上一個候選的殘留），並立刻同步進畫面上的 input——
+    // 這裡不透過整包重繪，避免打斷其他曲目正在進行的編輯。
+    const newValues = metaToEditValues(meta);
+    edits.set(trackId, newValues);
+    const editFieldsEl = article.querySelector(".edit-fields");
+    EDITABLE_FIELDS.forEach((field) => {
+      const input = editFieldsEl.querySelector(`[data-field="${field}"]`);
+      if (input) input.value = newValues[field] ?? "";
+    });
   });
 
   const cover = document.createElement("img");
@@ -175,13 +319,12 @@ function renderCandidate(trackId, candidate, index, isSelected) {
   return div;
 }
 
-function confirmTrack(button, track, index) {
-  const meta = track.candidates[index]?.meta;
-  if (!meta) return Promise.resolve();
+function confirmTrack(button, trackId, baseMeta, values) {
+  const meta = buildMetaPayload(baseMeta, values);
   return postAction(
     button,
-    track.id,
-    `/api/tracks/${track.id}/confirm`,
+    trackId,
+    `/api/tracks/${trackId}/confirm`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },

@@ -9,7 +9,7 @@
 <body>
   <header>
     <h1>音樂下載工具</h1>
-    <p class="hint">貼上 YouTube Music 網址，一行一個。標籤由 MusicBrainz 公開資料補齊，下載前需確認。</p>
+    <p class="hint">貼上 YouTube Music 網址，一行一個。標籤由 MusicBrainz 公開資料補齊，下載前可逐首確認，候選配錯或查無資料時可直接修改欄位。</p>
   </header>
 
   <section class="submit">
@@ -36,6 +36,17 @@ https://music.youtube.com/playlist?list=OLAK5uy_..."></textarea>
         <span class="status"></span>
       </div>
       <div class="candidates"></div>
+      <fieldset class="edit-fields">
+        <legend>標籤內容（可修改後再確認）</legend>
+        <label>標題<input type="text" data-field="title" autocomplete="off"></label>
+        <label>演出者<input type="text" data-field="artists" autocomplete="off" placeholder="多位演出者以「; 」分隔"></label>
+        <label>專輯演出者<input type="text" data-field="album_artist" autocomplete="off"></label>
+        <label>專輯<input type="text" data-field="album" autocomplete="off"></label>
+        <label>年份<input type="number" data-field="year" step="1" autocomplete="off"></label>
+        <label>曲序<input type="number" data-field="track_no" step="1" min="0" autocomplete="off"></label>
+        <label>總曲數<input type="number" data-field="track_total" step="1" min="0" autocomplete="off"></label>
+        <label>曲風<input type="text" data-field="genre" autocomplete="off"></label>
+      </fieldset>
       <div class="actions">
         <button class="confirm">確認並下載</button>
         <button class="skip">跳過</button>
