@@ -202,3 +202,60 @@ def test_download_streams_accepts_opus_container_directly(tmp_path):
     assert result.opus.exists()
     assert result.opus.name == "abc123.opus"
     assert calls == []  # 已經是 .opus 容器，不該呼叫 remux
+
+
+def test_download_streams_skips_opus_when_not_wanted(tmp_path):
+    """冷存關閉時，opus 那條串流完全不能發出下載請求。
+
+    重點不只是少一個檔案 —— 少抓一條串流等於下載時間與流量減半。
+    """
+    formats = []
+
+    def factory(opts):
+        formats.append(opts["format"])
+        suffix = ".m4a" if "m4a" in opts["format"] else ".webm"
+        return _FakeYDL(opts, suffix)
+
+    result = download_streams(
+        "abc123", tmp_path, ydl_factory=factory, ffmpeg="ffmpeg", fetch_opus=False
+    )
+
+    assert result.opus is None
+    assert len(formats) == 1, f"不該對 opus 發出請求，實際請求了：{formats}"
+    assert "m4a" in formats[0]
+    assert result.m4a.exists()
+    assert not list(tmp_path.glob("*.opus"))
+    assert not list(tmp_path.glob("*.webm"))
+
+
+def test_download_streams_fetches_both_by_default(tmp_path):
+    """預設維持原本行為，既有呼叫端與測試的語意不變。"""
+    formats = []
+
+    def factory(opts):
+        formats.append(opts["format"])
+        suffix = ".m4a" if "m4a" in opts["format"] else ".webm"
+        return _FakeYDL(opts, suffix)
+
+    result = download_streams(
+        "abc123",
+        tmp_path,
+        ydl_factory=factory,
+        ffmpeg="ffmpeg",
+        runner=lambda cmd, **kw: (Path(cmd[-1]).write_bytes(b"opus"), _FakeCompleted())[1],
+    )
+
+    assert result.opus is not None and result.opus.exists()
+    assert len(formats) == 2
+
+
+def test_download_streams_without_opus_does_not_require_ffmpeg(tmp_path, monkeypatch):
+    """ffmpeg 只用於 opus remux；關掉冷存後不該再強制要求它存在。"""
+    monkeypatch.setattr("app.config.shutil.which", lambda _: None)
+
+    def factory(opts):
+        return _FakeYDL(opts, ".m4a")
+
+    result = download_streams("abc123", tmp_path, ydl_factory=factory, fetch_opus=False)
+    assert result.m4a.exists()
+    assert result.opus is None

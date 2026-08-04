@@ -549,3 +549,98 @@ def test_submit_never_looks_up_genre_during_matching(pipeline):
     pipeline._genre_fn = lambda release_mbid, *, client: calls.append(release_mbid) or "rock"
     pipeline.submit("https://music.youtube.com/watch?v=v1")
     assert calls == []
+
+
+def _archive_pipeline(tmp_path, *, keep_archive: bool, write_fn=None):
+    """建一條可切換冷存副本的 pipeline，其餘相依都注入假實作。"""
+    store = JobStore(tmp_path / f"jobs-{keep_archive}.db")
+    store.init_schema()
+    roots = LibraryRoots(music=tmp_path / "Music", archive=tmp_path / "Archive")
+
+    def fake_download(video_id, workdir, *, fetch_opus=True, **kwargs):
+        workdir.mkdir(parents=True, exist_ok=True)
+        m4a = workdir / f"{video_id}.m4a"
+        m4a.write_bytes(b"m4a")
+        opus = None
+        if fetch_opus:
+            opus = workdir / f"{video_id}.opus"
+            opus.write_bytes(b"opus")
+        return DownloadedStreams(m4a=m4a, opus=opus)
+
+    tagged = []
+    pipe = Pipeline(
+        store,
+        roots,
+        workdir=tmp_path / "work",
+        client_factory=lambda: httpx.Client(
+            transport=httpx.MockTransport(lambda r: httpx.Response(200, content=b""))
+        ),
+        probe_fn=lambda url: [_source()],
+        search_fn=lambda q, client: [],
+        download_fn=fake_download,
+        cover_fn=lambda url, client: b"",
+        genre_fn=lambda mbid, client: None,
+        write_fn=write_fn or (lambda path, meta, cover=None: tagged.append(path)),
+        keep_archive_copy=keep_archive,
+    )
+    pipe.tagged = tagged
+    return pipe
+
+
+def _run_to_finalize(pipe):
+    job_id = pipe.submit("https://music.youtube.com/watch?v=v1")
+    track = pipe.store.get_job(job_id).tracks[0]
+    pipe.store.confirm(track.id, _meta())
+    pipe.finalize(track.id)
+    return pipe.store.get_track(track.id)
+
+
+def test_finalize_files_only_m4a_when_archive_disabled(tmp_path):
+    pipe = _archive_pipeline(tmp_path, keep_archive=False)
+    final = _run_to_finalize(pipe)
+
+    assert final.status == TrackStatus.DONE
+    assert (tmp_path / "Music" / "指尖笑" / "人間驚鴻宴" / "01 人間驚鴻宴.m4a").exists()
+    assert not (tmp_path / "Archive").exists(), "冷存關閉時不該建出 Archive 樹"
+    assert [p.suffix for p in pipe.tagged] == [".m4a"], "只該對 m4a 寫標籤"
+    pipe.store.close()
+
+
+def test_finalize_files_both_when_archive_enabled(tmp_path):
+    pipe = _archive_pipeline(tmp_path, keep_archive=True)
+    final = _run_to_finalize(pipe)
+
+    assert final.status == TrackStatus.DONE
+    assert (tmp_path / "Music" / "指尖笑" / "人間驚鴻宴" / "01 人間驚鴻宴.m4a").exists()
+    assert (tmp_path / "Archive" / "指尖笑" / "人間驚鴻宴" / "01 人間驚鴻宴.opus").exists()
+    assert sorted(p.suffix for p in pipe.tagged) == [".m4a", ".opus"]
+    pipe.store.close()
+
+
+def test_stale_archive_file_does_not_block_download_when_archive_disabled(tmp_path):
+    """冷存關閉後，Archive 樹裡的舊檔不該擋住一次根本不會寫到那裡的下載。"""
+    stale = tmp_path / "Archive" / "指尖笑" / "人間驚鴻宴" / "01 人間驚鴻宴.opus"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_bytes(b"previous run")
+
+    pipe = _archive_pipeline(tmp_path, keep_archive=False)
+    final = _run_to_finalize(pipe)
+
+    assert final.status == TrackStatus.DONE, f"不該被舊檔擋下：{final.error}"
+    assert stale.read_bytes() == b"previous run", "舊檔不該被動到"
+    pipe.store.close()
+
+
+@pytest.mark.parametrize("keep_archive", [True, False])
+def test_workdir_left_clean_on_tagging_failure(tmp_path, keep_archive):
+    def boom(path, meta, cover=None):
+        raise RuntimeError("寫標籤爆炸")
+
+    pipe = _archive_pipeline(tmp_path, keep_archive=keep_archive, write_fn=boom)
+    final = _run_to_finalize(pipe)
+
+    assert final.status == TrackStatus.FAILED
+    leftovers = list((tmp_path / "work").rglob("*")) if (tmp_path / "work").exists() else []
+    assert not [p for p in leftovers if p.is_file()], f"workdir 留下殘骸：{leftovers}"
+    assert not (tmp_path / "Music").exists() or not list((tmp_path / "Music").rglob("*.m4a"))
+    pipe.store.close()

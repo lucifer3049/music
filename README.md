@@ -55,7 +55,8 @@
 | 環境變數 | 預設值 | 說明 |
 |---|---|---|
 | `MUSIC_ROOT` | `D:\Music` | m4a 輸出根目錄，供播放器／媒體伺服器掃描 |
-| `ARCHIVE_ROOT` | `D:\Archive` | opus 輸出根目錄，冷存不掃描 |
+| `ARCHIVE_ROOT` | `D:\Archive` | opus 輸出根目錄，冷存不掃描。僅在 `KEEP_ARCHIVE_COPY` 開啟時才會用到 |
+| `KEEP_ARCHIVE_COPY` | 關閉 | 是否額外保留一份 opus 冷存副本。填 `1`／`true`／`yes` 開啟，其餘（含未設定）皆為關閉 |
 | `MUSICBRAINZ_CONTACT` | 未設定時使用內建佔位字串 | MusicBrainz 規定 User-Agent 必須帶可辨識的聯絡方式，否則請求可能被拒。請設成自己的 email，不要留預設值 |
 | `MUSIC_DOWNLOADER_PORT` | `8899` | 網頁介面的埠。只有跟其他程式衝突時才需要改；`start.bat` 遇到埠被占用會自動往後找 |
 
@@ -65,12 +66,16 @@
 
 ## 輸出格式
 
-每首歌同時產出兩份，皆不重新編碼：
+預設只產出一份 m4a，不重新編碼：
 
 | 位置 | 格式 | 用途 |
 |---|---|---|
 | `MUSIC_ROOT` | m4a（AAC，來源原始 bitrate，通常為 128kbps） | 日常播放。Windows 檔案總管、手機、車機原生讀標籤與封面 |
-| `ARCHIVE_ROOT` | opus（來源原始 bitrate） | 冷存。opus 是 YouTube 提供的較高品質串流，實際 bitrate 依影片而異（並非固定值），但檔案總管不顯示其標籤 |
+| `ARCHIVE_ROOT` | opus（來源原始 bitrate） | **預設關閉**，需設 `KEEP_ARCHIVE_COPY=1` 才會產生 |
+
+原本設計會同時存一份 opus 當冷存副本。實測發現同一首歌 opus 約 129kbps、m4a 約 128kbps —— 來源 bitrate 逐支影片而異，opus 並不可靠地比較高，多這一份只是把儲存空間翻倍，而且 Windows 檔案總管根本不顯示 Opus 標籤。因此改為預設關閉。
+
+開啟後除了佔用空間加倍，**下載時間也會加倍**，因為兩條串流都要抓。
 
 路徑結構為 `<根目錄>/<專輯演出者>/<專輯>/<曲序 曲名>.<副檔名>`（`app/storage/layout.py`），檔名會做 Windows 非法字元／保留裝置名淨化。封面圖只寫一份 `cover.jpg` 到 `MUSIC_ROOT` 的專輯資料夾內；opus 檔案本身也內嵌封面（Vorbis comment `METADATA_BLOCK_PICTURE`），m4a 內嵌於 `covr` atom。
 
@@ -91,7 +96,7 @@
 
     .venv\Scripts\python.exe -m pytest -q
 
-目前共 187 個測試，全部使用 fixture 與 mock，不對 MusicBrainz 或 YouTube 發出任何真實請求。
+目前共 208 個測試，全部使用 fixture 與 mock，不對 MusicBrainz 或 YouTube 發出任何真實請求。
 
 ## 執行紀錄
 

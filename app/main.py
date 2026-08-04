@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from app.api.routes import create_app
-from app.config import load_roots, require_ffmpeg
+from app.config import keep_archive_copy, load_roots, require_ffmpeg
 from app.jobs.store import JobStore
 from app.pipeline import Pipeline
 
@@ -25,7 +25,14 @@ def build() -> FastAPI:
     # 不收斂會讓那些曲目永遠卡住（SSE 迴圈不結束、confirm/skip 永遠 409）。
     # 見 JobStore.recover_interrupted_tracks() 的說明。
     store.recover_interrupted_tracks("伺服器重啟時中斷，可重新確認")
-    pipeline = Pipeline(store, load_roots(), workdir=WORKDIR)
+    # 正式環境的預設值在這裡決定：冷存副本預設關閉（見 config.keep_archive_copy
+    # 的說明）。Pipeline 建構子本身仍預設 True，維持既有測試的原本語意。
+    pipeline = Pipeline(
+        store,
+        load_roots(),
+        workdir=WORKDIR,
+        keep_archive_copy=keep_archive_copy(),
+    )
     application = create_app(pipeline)
     application.mount("/", StaticFiles(directory=BASE_DIR / "web", html=True), name="web")
     return application

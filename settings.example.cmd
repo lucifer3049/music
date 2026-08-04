@@ -24,6 +24,13 @@ rem Archive root. The opus files land here. Do not let players scan this
 rem tree as well, or every track shows up twice in your library.
 rem set ARCHIVE_ROOT=D:\Archive
 
+rem Keep a second copy of every track as .opus under ARCHIVE_ROOT.
+rem Off by default: a live measurement found opus at ~129 kbps against m4a at
+rem ~128 kbps, so the source bitrate is not reliably higher and the second copy
+rem roughly doubles storage for no real gain. Turning this on also doubles
+rem download time, since both streams have to be fetched.
+rem set KEEP_ARCHIVE_COPY=1
+
 rem Port for the web interface. Default is 8899. Only change this if it
 rem clashes with something else; start.bat already searches forward when
 rem the port is busy.

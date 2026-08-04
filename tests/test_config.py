@@ -2,7 +2,13 @@ from pathlib import Path
 
 import pytest
 
-from app.config import FfmpegMissingError, LibraryRoots, load_roots, require_ffmpeg
+from app.config import (
+    FfmpegMissingError,
+    LibraryRoots,
+    keep_archive_copy,
+    load_roots,
+    require_ffmpeg,
+)
 
 
 def test_load_roots_uses_defaults(monkeypatch):
@@ -28,3 +34,21 @@ def test_require_ffmpeg_raises_when_absent(monkeypatch):
     monkeypatch.setattr("app.config.shutil.which", lambda _: None)
     with pytest.raises(FfmpegMissingError):
         require_ffmpeg()
+
+
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", "Yes", " yes "])
+def test_keep_archive_copy_recognises_truthy_spellings(monkeypatch, value):
+    monkeypatch.setenv("KEEP_ARCHIVE_COPY", value)
+    assert keep_archive_copy() is True
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", "", "  ", "maybe", "on"])
+def test_keep_archive_copy_treats_anything_else_as_off(monkeypatch, value):
+    """無法辨識的值一律關閉 —— 打錯字不該悄悄讓儲存空間翻倍。"""
+    monkeypatch.setenv("KEEP_ARCHIVE_COPY", value)
+    assert keep_archive_copy() is False
+
+
+def test_keep_archive_copy_defaults_to_off(monkeypatch):
+    monkeypatch.delenv("KEEP_ARCHIVE_COPY", raising=False)
+    assert keep_archive_copy() is False

@@ -87,6 +87,7 @@ class Pipeline:
         cover_fn=musicbrainz.fetch_cover,
         genre_fn=musicbrainz.fetch_genre,
         write_fn=write_tags,
+        keep_archive_copy: bool = True,
     ) -> None:
         self.store = store
         self.roots = roots
@@ -98,6 +99,10 @@ class Pipeline:
         self._cover_fn = cover_fn
         self._genre_fn = genre_fn
         self._write_fn = write_fn
+        # 預設 True，維持既有呼叫端與測試「兩份都留」的原本意思；正式環境的
+        # 「預設關閉」是 app/main.py 呼叫 config.keep_archive_copy() 時決定的，
+        # 不是這個建構子預設值的責任。
+        self._keep_archive_copy = keep_archive_copy
 
     def submit(self, url: str) -> int:
         """探測網址並為每首曲目產生候選標籤。回傳 job id。
@@ -184,7 +189,9 @@ class Pipeline:
         streams: youtube.DownloadedStreams | None = None
         try:
             self.store.set_status(track_id, TrackStatus.DOWNLOADING)
-            streams = self._download_fn(row.video_id, track_workdir)
+            streams = self._download_fn(
+                row.video_id, track_workdir, fetch_opus=self._keep_archive_copy
+            )
 
             self.store.set_status(track_id, TrackStatus.TAGGING)
             cover = self._fetch_cover(meta)
@@ -199,7 +206,8 @@ class Pipeline:
             # mutagen.MutagenError（繼承 Exception，不是 OSError），必須明確
             # 接住才會落進下方「下載／標籤失敗」分支，而不是被當成程式臭蟲。
             self._write_fn(streams.m4a, meta, cover)
-            self._write_fn(streams.opus, meta, cover)
+            if streams.opus is not None:
+                self._write_fn(streams.opus, meta, cover)
 
             paths = build_paths(self.roots, meta)
             # shutil.move() 在 Windows 上撞到既有檔案會靜默覆蓋。同一首歌從
@@ -207,7 +215,10 @@ class Pipeline:
             # 同一個落地路徑——第二次 confirm 若不擋，會無聲毀掉第一次的下載
             # 成果。這裡只擋下、不覆蓋，讓使用者自行判斷；互動式覆蓋流程超出
             # 本次修復範圍。
-            conflict = next((p for p in (paths.m4a, paths.opus) if p.exists()), None)
+            # 只檢查這次真的會寫入的目的地。冷存關閉時 Archive 樹底下即使留著
+            # 舊的 opus，也不該擋住一次根本不會寫到那裡的下載。
+            destinations = [paths.m4a] + ([paths.opus] if streams.opus is not None else [])
+            conflict = next((p for p in destinations if p.exists()), None)
             if conflict is not None:
                 self.store.set_status(
                     track_id,
@@ -217,9 +228,10 @@ class Pipeline:
                 return
 
             paths.m4a.parent.mkdir(parents=True, exist_ok=True)
-            paths.opus.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(streams.m4a), paths.m4a)
-            shutil.move(str(streams.opus), paths.opus)
+            if streams.opus is not None:
+                paths.opus.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(streams.opus), paths.opus)
             if cover and not paths.cover.exists():
                 paths.cover.write_bytes(cover)
 
@@ -245,7 +257,8 @@ class Pipeline:
             # no-op，不會動到圖書館裡的檔案。
             if streams is not None:
                 streams.m4a.unlink(missing_ok=True)
-                streams.opus.unlink(missing_ok=True)
+                if streams.opus is not None:
+                    streams.opus.unlink(missing_ok=True)
             try:
                 track_workdir.rmdir()
             except OSError:

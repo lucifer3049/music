@@ -162,7 +162,7 @@ class DownloadError(RuntimeError):
 @dataclass(frozen=True, slots=True)
 class DownloadedStreams:
     m4a: Path
-    opus: Path
+    opus: Path | None
 
 
 def _download_one(video_id: str, workdir: Path, fmt: str, stem: str, ydl_factory) -> None:
@@ -216,14 +216,23 @@ def download_streams(
     ydl_factory=_default_ydl_factory,
     ffmpeg: str | None = None,
     runner=subprocess.run,
+    fetch_opus: bool = True,
 ) -> DownloadedStreams:
-    """下載 m4a 與 opus 兩條串流到 workdir，回傳兩個檔案路徑。
+    """下載 m4a（一定要）與 opus（視 fetch_opus 而定）到 workdir。
+
+    fetch_opus=False 時完全不會對 opus 那條串流發出任何下載請求 —— 這是省下
+    一半下載時間與頻寬的關鍵，不只是少寫一個檔案，此時回傳的 opus 為 None。
+    預設 True，維持既有呼叫端與測試原本「兩條都抓」的行為不變。
 
     失敗時（任一階段拋出例外）會清掉這次呼叫已經在 workdir 建立的檔案，
     避免下次針對同一個 workdir 重試時，撞見上次留下的殘缺檔案。
     """
     workdir.mkdir(parents=True, exist_ok=True)
-    ffmpeg = ffmpeg or require_ffmpeg()
+    # opus 關閉時完全不需要 ffmpeg（remux 是唯一用途），這裡不要求它，讓 opus
+    # 關閉的使用者即使沒裝 ffmpeg 也能下載 m4a。開啟時維持原本「一開始就要
+    # 求」的順序，行為與之前完全一致。
+    if fetch_opus:
+        ffmpeg = ffmpeg or require_ffmpeg()
 
     created: list[Path] = []
     try:
@@ -235,6 +244,9 @@ def download_streams(
         m4a = workdir / f"{video_id}.m4a"
         found_m4a.rename(m4a)
         created.append(m4a)
+
+        if not fetch_opus:
+            return DownloadedStreams(m4a=m4a, opus=None)
 
         _download_one(video_id, workdir, _FORMAT_OPUS, f"{video_id}.opus_src", ydl_factory)
         webm = _find_one(workdir, f"{video_id}.opus_src", (".webm", ".opus", ".ogg"))
