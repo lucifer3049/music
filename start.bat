@@ -9,7 +9,10 @@ title Music Downloader
 
 rem Optional user settings (library paths, MusicBrainz contact, port).
 rem Not tracked by git, so updates never clobber them.
-if exist "settings.local.cmd" call "settings.local.cmd"
+rem Use %~dp0 rather than a bare name: cmd's CALL does not resolve a
+rem quoted bare filename against the current directory, so the settings
+rem file would silently never load.
+if exist "%~dp0settings.local.cmd" call "%~dp0settings.local.cmd"
 
 if not exist ".venv\Scripts\python.exe" (
     echo First run: creating the virtual environment and installing dependencies.
