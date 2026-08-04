@@ -10,3 +10,4 @@ _devlib/
 .claude/serve.ps1
 jobs.db-shm
 jobs.db-wal
+settings.local.cmd

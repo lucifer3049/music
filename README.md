@@ -18,20 +18,37 @@
 - Python 3.12 以上
 - ffmpeg 在 PATH 上（`winget install Gyan.FFmpeg`，安裝後需重開終端機）
 
-## 安裝
+## 啟動（一般使用）
+
+**雙擊 `start.bat`。** 它會自己處理其餘的事：
+
+- 首次執行時建立虛擬環境並安裝相依套件（只做一次，需要幾分鐘）
+- ffmpeg 不在 PATH 時，自動搜尋常見安裝位置
+- 伺服器就緒後自動開啟瀏覽器
+- 已經有一份在跑時，不會報錯，直接把瀏覽器指向現有那份
+
+關閉那個主控台視窗即停止伺服器。
+
+想放到桌面的話，對 `start.bat` 按右鍵 →「傳送到」→「桌面（建立捷徑）」。
+
+### 個人設定
+
+複製 `settings.example.cmd` 為 `settings.local.cmd`，把要用的那幾行前面的 `rem` 拿掉再填值。`settings.local.cmd` 不進版控，更新程式不會覆蓋你的設定。
+
+至少建議設定 `MUSICBRAINZ_CONTACT`（見下方「設定」）。
+
+## 啟動（開發用）
+
+    .venv\Scripts\python.exe -m uvicorn app.main:app --port 8899
+
+`app/main.py` 在 import 階段就會呼叫 `require_ffmpeg()`，所以 ffmpeg 必須先在 PATH 上，伺服器才啟動得起來（見「疑難排解」）。
+
+手動建立環境：
 
     python -m venv .venv
     .venv\Scripts\python.exe -m pip install -e ".[dev]"
 
-## 啟動
-
-    .venv\Scripts\python.exe -m uvicorn app.main:app --port 8765
-
-瀏覽器開 http://127.0.0.1:8765
-
-`app/main.py` 在 import 階段就會呼叫 `require_ffmpeg()`，所以 ffmpeg 必須先在 PATH 上，伺服器才啟動得起來（見「疑難排解」）。
-
-> repo 內另有 `.claude/launch.json` 與 `.claude/serve.ps1`，是開發用的啟動捷徑（`serve.ps1` 因含機器專屬的 ffmpeg 路徑而被 `.gitignore` 排除）。日常執行請用上面的 uvicorn 指令，不依賴這兩個檔案。
+> repo 內另有 `.claude/launch.json` 與 `.claude/serve.ps1`，是開發用的啟動捷徑，**會把輸出導向暫存的 `_devlib/`，不是你的正式音樂庫**，只適合改前端時使用。日常請用 `start.bat`。
 
 ## 設定
 
@@ -40,6 +57,9 @@
 | `MUSIC_ROOT` | `D:\Music` | m4a 輸出根目錄，供播放器／媒體伺服器掃描 |
 | `ARCHIVE_ROOT` | `D:\Archive` | opus 輸出根目錄，冷存不掃描 |
 | `MUSICBRAINZ_CONTACT` | 未設定時使用內建佔位字串 | MusicBrainz 規定 User-Agent 必須帶可辨識的聯絡方式，否則請求可能被拒。請設成自己的 email，不要留預設值 |
+| `MUSIC_DOWNLOADER_PORT` | `8899` | 網頁介面的埠。只有跟其他程式衝突時才需要改；`start.bat` 遇到埠被占用會自動往後找 |
+
+用 `start.bat` 啟動時，這些變數寫在 `settings.local.cmd` 裡（範本見 `settings.example.cmd`）。
 
 `MUSIC_ROOT` / `ARCHIVE_ROOT` 由 `app/config.py` 的 `load_roots()` 讀取；`MUSICBRAINZ_CONTACT` 由 `app/sources/musicbrainz.py` 直接讀取環境變數，未設定時退回一句提示文字（不是空字串、也不是真實 email），MusicBrainz 有可能因此拒絕請求或降低優先度。
 
