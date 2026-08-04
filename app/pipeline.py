@@ -24,6 +24,8 @@ import shutil
 from dataclasses import replace
 from pathlib import Path
 
+import mutagen
+
 from app.config import LibraryRoots
 from app.jobs.store import JobStore, TrackStatus
 from app.matching.matcher import rank_candidates, split_title
@@ -158,9 +160,19 @@ class Pipeline:
             raise ValueError(f"曲目 {track_id} 尚未確認標籤")
 
         meta = row.chosen
+        # 每次 finalize() 用專屬子目錄下載，不共用 self.workdir：
+        # download_streams() 內部用 video_id 當暫存檔名主幹，dedup 只看
+        # video_id、但兩個不同 video_id（例如官方 MV 與 Topic 頻道上傳同一
+        # 首歌）各自比對到候選、各自被 confirm 是完全合法的操作序列，若同一
+        # video_id 被兩個不同 track 並行 confirm，兩個背景執行緒會撞進同一個
+        # workdir、共用同一組暫存檔名，彼此的失敗清理還可能刪掉對方正在搬移
+        # 的檔案。以 track_id 分目錄從根本上排除撞名，且不需更動
+        # youtube.download_streams() 的介面（它本來就只認得 workdir + video_id）。
+        track_workdir = self.workdir / str(track_id)
+        streams: youtube.DownloadedStreams | None = None
         try:
             self.store.set_status(track_id, TrackStatus.DOWNLOADING)
-            streams = self._download_fn(row.video_id, self.workdir)
+            streams = self._download_fn(row.video_id, track_workdir)
 
             self.store.set_status(track_id, TrackStatus.TAGGING)
             cover = self._fetch_cover(meta)
@@ -171,11 +183,27 @@ class Pipeline:
             # 先在 workdir 就地標籤，成功了才搬進 Music/Archive —— 檔案只有
             # 「完整標籤過」才能進圖書館；標籤失敗絕不能留下未標記、但檔名／
             # 路徑看起來完全正常的檔案在使用者的真實收藏裡（Task 10 review
-            # Finding 2）。
+            # Finding 2）。mutagen 對截斷或格式錯誤的音檔一律拋
+            # mutagen.MutagenError（繼承 Exception，不是 OSError），必須明確
+            # 接住才會落進下方「下載／標籤失敗」分支，而不是被當成程式臭蟲。
             self._write_fn(streams.m4a, meta, cover)
             self._write_fn(streams.opus, meta, cover)
 
             paths = build_paths(self.roots, meta)
+            # shutil.move() 在 Windows 上撞到既有檔案會靜默覆蓋。同一首歌從
+            # 兩個不同 video_id 下載，可能比對到同一個 MusicBrainz 候選、算出
+            # 同一個落地路徑——第二次 confirm 若不擋，會無聲毀掉第一次的下載
+            # 成果。這裡只擋下、不覆蓋，讓使用者自行判斷；互動式覆蓋流程超出
+            # 本次修復範圍。
+            conflict = next((p for p in (paths.m4a, paths.opus) if p.exists()), None)
+            if conflict is not None:
+                self.store.set_status(
+                    track_id,
+                    TrackStatus.FAILED,
+                    error=f"目的檔案已存在，為避免覆蓋既有下載而中止：{conflict}",
+                )
+                return
+
             paths.m4a.parent.mkdir(parents=True, exist_ok=True)
             paths.opus.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(streams.m4a), paths.m4a)
@@ -184,7 +212,7 @@ class Pipeline:
                 paths.cover.write_bytes(cover)
 
             self.store.set_status(track_id, TrackStatus.DONE)
-        except (youtube.DownloadError, UnsupportedFormatError, OSError) as exc:
+        except (youtube.DownloadError, UnsupportedFormatError, mutagen.MutagenError, OSError) as exc:
             self.store.set_status(track_id, TrackStatus.FAILED, error=str(exc))
         except Exception as exc:
             # 非預期的內部錯誤（例如程式邏輯本身的臭蟲）跟「下載／標籤失敗」
@@ -193,6 +221,19 @@ class Pipeline:
             self.store.set_status(
                 track_id, TrackStatus.FAILED, error=f"未預期的內部錯誤：{exc}"
             )
+        finally:
+            # 只要串流檔還留在 workdir（下載成功、但後續任一步失敗，或撞到
+            # 落地衝突提早 return），就代表沒被搬進圖書館，必須清掉，否則每次
+            # 失敗都在 workdir 留下約 10 MB 的完整音檔。已成功搬走的檔案，這裡
+            # 的來源路徑早已不存在，unlink(missing_ok=True) 只是無害的
+            # no-op，不會動到圖書館裡的檔案。
+            if streams is not None:
+                streams.m4a.unlink(missing_ok=True)
+                streams.opus.unlink(missing_ok=True)
+            try:
+                track_workdir.rmdir()
+            except OSError:
+                pass
 
     def _fetch_cover(self, meta: TrackMeta) -> bytes | None:
         """封面失敗不算致命錯誤 —— 沒圖的歌還是要能收藏。

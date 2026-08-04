@@ -159,6 +159,42 @@ class JobStore:
                 (status.value, error, track_id),
             )
 
+    def recover_interrupted_tracks(self, message: str) -> int:
+        """啟動時把上次行程留下的「進行中」曲目收斂成 FAILED。
+
+        `MATCHING` / `DOWNLOADING` / `TAGGING` 都代表「上次進程還在跑到一半」——
+        這三個狀態只會由背景執行緒在單次 submit()/finalize() 呼叫中設置，一旦
+        process 中途死掉，資料庫裡就會永遠停在這裡：不是終態（見
+        `app/api/routes.py` 的 `TERMINAL_STATUSES`），SSE 迴圈永遠不會結束，
+        confirm／skip 又因為狀態不是 AWAITING_CONFIRM 而回 409，使用者無法
+        重新確認也無法重試，只能看著前端永遠顯示「下載中」。
+
+        啟動時把這些行收斂成 FAILED，訊息說明原因；使用者接著能重新送出同一個
+        網址——dedup 只把 DONE 視為重複（見 Pipeline._process_source()），
+        FAILED 不算，所以這樣就能重新走一次完整流程。
+
+        `PENDING` 不在掃描範圍內：那是 `add_track()` 剛插入、還沒被任何背景
+        執行緒摸過的初始狀態，`_process_source()` 全程同步執行到
+        `_match_one()`（沒有跨執行緒交棒），因此 `PENDING` 只會在單一次
+        `submit()` 呼叫「內部」短暫存在。process 死掉時，要嘛整個
+        `submit()` 呼叫沒開始跑（該 track 列根本不存在），要嘛已經跑過
+        `add_track()` 所在的那個當下執行緒還活著、會繼續往下跑到
+        `MATCHING`——不會有一筆卡在 `PENDING` 卻沒人打算再處理它的紀錄。
+        把它排除在掃描外，是為了不誤傷這個瞬間、無害的中繼狀態。
+        """
+        stuck = (
+            TrackStatus.MATCHING.value,
+            TrackStatus.DOWNLOADING.value,
+            TrackStatus.TAGGING.value,
+        )
+        placeholders = ", ".join("?" for _ in stuck)
+        with self._write_lock:
+            cursor = self._conn.execute(
+                f"UPDATE tracks SET status = ?, error = ? WHERE status IN ({placeholders})",
+                (TrackStatus.FAILED.value, message, *stuck),
+            )
+            return cursor.rowcount
+
     def set_job_error(self, job_id: int, message: str) -> None:
         """記錄 job 層級失敗（探測整批拿不到任何曲目時）。
 

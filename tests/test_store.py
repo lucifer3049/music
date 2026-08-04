@@ -145,6 +145,45 @@ def test_set_job_error_visible_via_list_jobs(store):
     assert jobs[0].error == "不支援的網址"
 
 
+def test_recover_interrupted_tracks_marks_stuck_statuses_failed(store):
+    """伺服器重啟時，MATCHING／DOWNLOADING／TAGGING 這三個非終態必須被收斂成
+    FAILED，否則永遠卡住（SSE 不結束、confirm/skip 永遠 409）。其餘狀態
+    （包含 PENDING）不該被動到。"""
+    job_id = store.create_job("u")
+    ids = {}
+    for status in (
+        TrackStatus.PENDING,
+        TrackStatus.MATCHING,
+        TrackStatus.AWAITING_CONFIRM,
+        TrackStatus.DOWNLOADING,
+        TrackStatus.TAGGING,
+        TrackStatus.DONE,
+        TrackStatus.FAILED,
+        TrackStatus.SKIPPED,
+    ):
+        track_id = store.add_track(job_id, _source(status.value))
+        store.set_status(track_id, status)
+        ids[status] = track_id
+
+    changed = store.recover_interrupted_tracks("伺服器重啟時中斷，可重新確認")
+    assert changed == 3
+
+    for status in (TrackStatus.MATCHING, TrackStatus.DOWNLOADING, TrackStatus.TAGGING):
+        row = store.get_track(ids[status])
+        assert row.status == TrackStatus.FAILED
+        assert row.error == "伺服器重啟時中斷，可重新確認"
+
+    for status in (
+        TrackStatus.PENDING,
+        TrackStatus.AWAITING_CONFIRM,
+        TrackStatus.DONE,
+        TrackStatus.FAILED,
+        TrackStatus.SKIPPED,
+    ):
+        row = store.get_track(ids[status])
+        assert row.status == status
+
+
 def test_schema_is_idempotent(tmp_path):
     s = JobStore(tmp_path / "jobs.db")
     s.init_schema()

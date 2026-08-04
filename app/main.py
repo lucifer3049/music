@@ -21,6 +21,10 @@ def build() -> FastAPI:
     require_ffmpeg()  # 缺 ffmpeg 就直接在啟動時炸，不要等下載到一半
     store = JobStore(DB_PATH)
     store.init_schema()
+    # 上次行程可能在 MATCHING／DOWNLOADING／TAGGING 半途死掉：這些不是終態，
+    # 不收斂會讓那些曲目永遠卡住（SSE 迴圈不結束、confirm/skip 永遠 409）。
+    # 見 JobStore.recover_interrupted_tracks() 的說明。
+    store.recover_interrupted_tracks("伺服器重啟時中斷，可重新確認")
     pipeline = Pipeline(store, load_roots(), workdir=WORKDIR)
     application = create_app(pipeline)
     application.mount("/", StaticFiles(directory=BASE_DIR / "web", html=True), name="web")

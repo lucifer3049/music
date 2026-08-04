@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import httpx
+import mutagen
 import pytest
 
 from app.config import LibraryRoots
@@ -149,6 +150,26 @@ def test_submit_does_not_skip_after_failed_download(pipeline):
     assert track.status == TrackStatus.AWAITING_CONFIRM
 
 
+def test_submit_does_not_skip_after_startup_recovery(pipeline):
+    """模擬伺服器重啟：曲目卡在 DOWNLOADING 時被 JobStore.recover_interrupted_tracks()
+    收斂成 FAILED 之後，重新送出同一個網址必須能正常走到 AWAITING_CONFIRM，
+    而不是被舊紀錄擋住（dedup 只認 DONE，見 Pipeline._process_source()）。"""
+    job_id = pipeline.submit("https://music.youtube.com/watch?v=v1")
+    first_track = pipeline.store.get_job(job_id).tracks[0]
+    pipeline.store.confirm(first_track.id, _meta())
+    # 不呼叫 finalize()：模擬 confirm() 已把狀態設成 DOWNLOADING、但 process
+    # 在背景執行緒真正跑 finalize() 之前就死掉了。
+    assert pipeline.store.get_track(first_track.id).status == TrackStatus.DOWNLOADING
+
+    changed = pipeline.store.recover_interrupted_tracks("伺服器重啟時中斷，可重新確認")
+    assert changed == 1
+    assert pipeline.store.get_track(first_track.id).status == TrackStatus.FAILED
+
+    job_id2 = pipeline.submit("https://music.youtube.com/watch?v=v1")
+    track = pipeline.store.get_job(job_id2).tracks[0]
+    assert track.status == TrackStatus.AWAITING_CONFIRM
+
+
 def test_submit_persists_probe_error_message(pipeline):
     """ProbeError（下架／私人／地區限制）必須被記錄，不能無聲吞掉。
 
@@ -256,6 +277,116 @@ def test_finalize_marks_failed_on_download_error(pipeline):
     assert "網路斷了" in final.error
 
 
+def test_finalize_marks_failed_on_mutagen_error_not_internal_error(pipeline):
+    """mutagen.MutagenError 繼承 Exception、不是 OSError（實測於本專案 venv 驗證），
+    截斷或格式錯誤的下載檔案是最可能觸發的真實情境，必須落進「下載／標籤失敗」
+    分支（訊息不帶「未預期的內部錯誤」前綴），而不是被誤判成程式臭蟲。
+
+    只斷言 status 或只斷言訊息內容「有出現」都無法區分兩個 except 分支（兩邊
+    都會把例外訊息塞進 final.error）——必須斷言前綴的有無，見
+    test_finalize_marks_internal_error_on_programming_bug 的對照組。"""
+    job_id = pipeline.submit("https://music.youtube.com/watch?v=v1")
+    track = pipeline.store.get_job(job_id).tracks[0]
+    pipeline.store.confirm(track.id, _meta())
+
+    def boom(path, meta, cover=None):
+        raise mutagen.MutagenError("檔案已截斷，無法解析")
+
+    pipeline._write_fn = boom
+    pipeline.finalize(track.id)
+
+    final = pipeline.store.get_track(track.id)
+    assert final.status == TrackStatus.FAILED
+    assert "檔案已截斷，無法解析" in final.error
+    assert not final.error.startswith("未預期的內部錯誤")
+
+
+def test_finalize_marks_internal_error_on_programming_bug(pipeline):
+    """真正的程式錯誤（例如 AttributeError）必須帶著「未預期的內部錯誤」前綴，
+    跟上面 MutagenError 的「下載／標籤失敗」分支明確區分開——這是這兩個 except
+    子句存在的唯一理由，訊息前綴是唯一能證明兩邊真的走不同分支的訊號。"""
+    job_id = pipeline.submit("https://music.youtube.com/watch?v=v1")
+    track = pipeline.store.get_job(job_id).tracks[0]
+    pipeline.store.confirm(track.id, _meta())
+
+    def boom(path, meta, cover=None):
+        raise AttributeError("'NoneType' object has no attribute 'save'")
+
+    pipeline._write_fn = boom
+    pipeline.finalize(track.id)
+
+    final = pipeline.store.get_track(track.id)
+    assert final.status == TrackStatus.FAILED
+    assert final.error.startswith("未預期的內部錯誤：")
+    assert "'NoneType' object has no attribute 'save'" in final.error
+
+
+def test_finalize_does_not_overwrite_existing_destination(pipeline, tmp_path):
+    """dedup 只看 video_id；同一首歌從兩個不同 video_id 下載，比對到同一個
+    MusicBrainz 候選時會算出同一個落地路徑。shutil.move() 在 Windows 上撞到
+    既有檔案會靜默覆蓋，第二次確認絕不能無聲毀掉第一次的下載成果——必須擋下
+    並標成 FAILED，讓使用者自己決定，而不是默默用新檔案取代舊檔案。"""
+    job_id = pipeline.submit("https://music.youtube.com/watch?v=v1")
+    track = pipeline.store.get_job(job_id).tracks[0]
+    pipeline.store.confirm(track.id, _meta())
+    pipeline.finalize(track.id)
+    assert pipeline.store.get_track(track.id).status == TrackStatus.DONE
+
+    dest_m4a = tmp_path / "Music" / "指尖笑" / "人間驚鴻宴" / "01 人間驚鴻宴.m4a"
+    original_bytes = dest_m4a.read_bytes()
+
+    # 第二筆曲目：不同 video_id，但比對到一樣的 MusicBrainz 候選（因此落地
+    # 路徑相同）——模擬「同一首歌，官方 MV + Topic 頻道兩個不同 video_id」。
+    pipeline._probe_fn = lambda url: [_source(video_id="v2")]
+    job_id2 = pipeline.submit("https://music.youtube.com/watch?v=v2")
+    track2 = pipeline.store.get_job(job_id2).tracks[0]
+    assert track2.status == TrackStatus.AWAITING_CONFIRM  # 不同 video_id，dedup 不擋
+    pipeline.store.confirm(track2.id, _meta())
+    pipeline.finalize(track2.id)
+
+    final2 = pipeline.store.get_track(track2.id)
+    assert final2.status == TrackStatus.FAILED
+    assert str(dest_m4a) in final2.error
+
+    # 第一次下載的檔案必須原封不動，第二次確認的暫存串流也不該留在 workdir。
+    assert dest_m4a.read_bytes() == original_bytes
+    assert list((tmp_path / "work").rglob("*")) == []
+
+
+def test_finalize_uses_a_workdir_unique_per_track_even_for_same_video_id(pipeline):
+    """两个不同 track_id 對應同一個 video_id 時（同一首歌重複送出、尚未確認任何
+    一筆），各自的 finalize() 必須用不同的暫存 workdir——youtube.download_streams()
+    內部用 video_id 當暫存檔名主幹，若兩個並行的 finalize() 共用同一個 workdir，
+    會撞進同一組暫存路徑，彼此的失敗清理還可能刪掉對方正在搬移的檔案
+    （Task 12 review Defect 5）。"""
+    job_id = pipeline.submit("https://music.youtube.com/watch?v=v1")
+    track1 = pipeline.store.get_job(job_id).tracks[0]
+    job_id2 = pipeline.submit("https://music.youtube.com/watch?v=v1")
+    track2 = pipeline.store.get_job(job_id2).tracks[0]
+    assert track1.id != track2.id
+
+    pipeline.store.confirm(track1.id, _meta())
+    pipeline.store.confirm(track2.id, _meta())
+
+    seen_workdirs = []
+
+    def fake_download(video_id, workdir, **kwargs):
+        seen_workdirs.append(workdir)
+        workdir.mkdir(parents=True, exist_ok=True)
+        m4a = workdir / f"{video_id}.m4a"
+        opus = workdir / f"{video_id}.opus"
+        m4a.write_bytes(b"m4a")
+        opus.write_bytes(b"opus")
+        return DownloadedStreams(m4a=m4a, opus=opus)
+
+    pipeline._download_fn = fake_download
+    pipeline.finalize(track1.id)
+    pipeline.finalize(track2.id)
+
+    assert len(seen_workdirs) == 2
+    assert seen_workdirs[0] != seen_workdirs[1]
+
+
 def test_finalize_survives_cover_failure(pipeline, tmp_path):
     """封面抓不到不該讓整首曲目失敗。"""
     job_id = pipeline.submit("https://music.youtube.com/watch?v=v1")
@@ -288,7 +419,11 @@ def test_finalize_skips_non_jpeg_cover(pipeline):
 
 def test_finalize_leaves_library_untouched_when_tagging_fails(pipeline, tmp_path):
     """標籤寫入必須發生在檔案還在 workdir 的時候，寫失敗就不能把未標記的檔案
-    留在真正的 Music/Archive 目錄裡 —— 那樣從資料夾看會跟正常下載完全分不出來。"""
+    留在真正的 Music/Archive 目錄裡 —— 那樣從資料夾看會跟正常下載完全分不出來。
+
+    同時（Task 12 review Defect 2）：下載成功、標籤寫入才失敗時，已經落地在
+    workdir 的完整 m4a／opus 串流檔（約 10 MB／次）也不能留著不管——
+    Pipeline.finalize() 的失敗路徑必須主動清掉它們，不能只是不搬走了事。"""
     job_id = pipeline.submit("https://music.youtube.com/watch?v=v1")
     track = pipeline.store.get_job(job_id).tracks[0]
     pipeline.store.confirm(track.id, _meta())
@@ -307,6 +442,8 @@ def test_finalize_leaves_library_untouched_when_tagging_fails(pipeline, tmp_path
 
     assert _files(tmp_path / "Music") == []
     assert _files(tmp_path / "Archive") == []
+    # workdir 底下這首曲目專屬的暫存目錄不該留下任何殘檔（含子目錄本身）。
+    assert _files(tmp_path / "work") == []
 
 
 def test_finalize_skips_cover_when_no_cover_url(pipeline):

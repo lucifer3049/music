@@ -71,7 +71,7 @@
 
     .venv\Scripts\python.exe -m pytest -q
 
-目前共 179 個測試，全部使用 fixture 與 mock，不對 MusicBrainz 或 YouTube 發出任何真實請求。
+目前共 185 個測試，全部使用 fixture 與 mock，不對 MusicBrainz 或 YouTube 發出任何真實請求。
 
 ## 疑難排解
 
@@ -83,3 +83,5 @@
 | `Archive/` 底下的 opus 檔案，檔案總管內容面板看不到任何標籤 | 預期行為，不是 bug。Windows 檔案總管不讀 Opus 標籤。改用 foobar2000、MusicBee 或 VLC 檢視；`Music/` 底下的 m4a 檔案沒有這個問題 |
 | 曲目狀態卡在「failed」 | 展開錯誤訊息。常見於影片下架或地區限制而無法下載，其餘情況可重新送出同一個網址重試 |
 | 點「確認並下載」或「跳過」沒反應、出現錯誤 | 後端回 409，代表這首曲目已經不在「待確認」狀態（可能已被確認、正在下載或已完成）。重新整理頁面確認目前狀態 |
+| 伺服器重啟後，重啟前正在下載／寫標籤的曲目變成「failed」，錯誤訊息是「伺服器重啟時中斷，可重新確認」 | 預期行為，不是資料遺失。`app/main.py` 啟動時會呼叫 `JobStore.recover_interrupted_tracks()`，把上次行程留在 `matching`／`downloading`／`tagging`（都是非終態）的曲目收斂成 `failed`，避免它們永遠卡住、SSE 也永遠不結束。重新送出同一個網址即可重新處理，`failed` 不算重複（見上方「使用流程」） |
+| 同一首歌從兩個不同網址（例如官方 MV 與自動生成的 Topic 頻道上傳）各自確認下載 | 第二次確認會失敗（`failed`），錯誤訊息會附上已存在的目的檔案路徑。dedup 只看 videoId，兩個不同 videoId 比對到同一個 MusicBrainz 候選時會算出同一個落地路徑，系統不會靜默覆蓋已下載的檔案；需要換掉時請自行刪除舊檔後重新確認 |
