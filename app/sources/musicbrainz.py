@@ -20,6 +20,14 @@ recording.length 單位是毫秒，TrackMeta.duration 是秒。
       所在碟片的曲數，不可誤用 —— 曲序要用 media[0]["track-count"]。
     - track["number"] 是字串，不一定是數字（黑膠可能是 "C3" 這種側別+序號），
       沒有獨立的 track["position"] 欄位；非數字時退回 None，不可炸掉。
+
+實測結論（Genre 調查，詳見 .superpowers/sdd/genre-report.md）：
+  recording 搜尋端點（不論帶不帶 inc）與 recording／release lookup 端點幾乎都拿不到
+  genre 資料；真正有資料的是 release-group 這一層。一次 release lookup、
+  `inc=genres+release-groups` 即可同時拿到 release 與其內嵌 release-group 的 genres，
+  見 fetch_genre()。這一趟查詢有實質延遲成本（節流 1.1 秒／次），因此故意不在
+  search() 比對階段對每個候選都查，只在 Pipeline.finalize() 對使用者確認的那一首
+  查一次（見 app/pipeline.py 的 Pipeline._fetch_genre()）。
 """
 
 from __future__ import annotations
@@ -132,6 +140,98 @@ def _track_position(release: dict) -> tuple[int | None, int | None]:
 
 def cover_url_for_release(release_mbid: str) -> str:
     return f"{COVER_ART_BASE}/{release_mbid}/front-500"
+
+
+def release_mbid_for_genre_lookup(meta: TrackMeta) -> str | None:
+    """從 TrackMeta.cover_url 反推 release MBID，供事後（Pipeline.finalize()）查 genre 用。
+
+    genre 查詢決策（見 .superpowers/sdd/genre-report.md Step 2）：只在使用者確認候選、
+    真的要下載那一首時才查，不在 search() 比對階段查（否則比對延遲乘上候選數）。但
+    `TrackMeta` 不能新增欄位存 release MBID —— `app/jobs/store.py` 的 `_meta_from_dict()`
+    對已存在資料庫的舊資料是 `TrackMeta(**data)`，沒有 dataclass 預設值，新增必填欄位
+    會讓舊資料讀取直接炸掉、整個工作列表掛掉。
+
+    好在 `cover_url` 本來就是 `cover_url_for_release()` 組出來的
+    `f"{COVER_ART_BASE}/{release_mbid}/front-500"`，release MBID 已經原樣編在裡面，
+    這裡只是照組成規則反向拆解，不是新增耦合。cover_url 為 None（單曲不屬於任何
+    release）時同樣沒有 release-group 可查，回 None。
+    """
+    if not isinstance(meta.cover_url, str):
+        return None
+    prefix = f"{COVER_ART_BASE}/"
+    suffix = "/front-500"
+    if not (meta.cover_url.startswith(prefix) and meta.cover_url.endswith(suffix)):
+        return None
+    mbid = meta.cover_url[len(prefix) : -len(suffix)]
+    return mbid or None
+
+
+def _top_genre(genres) -> str | None:
+    """把 MusicBrainz 的 genres[]（受控詞彙，帶投票數 count）收斂成單一字串。
+
+    取 count 最高者：這是「大眾認知的主要類型」最直接的代理指標，比「取回應
+    第一筆」（MusicBrainz 不保證陣列順序穩定）或「全部串接」（Windows 檔案總管
+    Genre 欄位是單一字串式呈現，塞一長串逗號分隔的類型不利閱讀／篩選，且會讓
+    tagging.writer 寫入的 `©gen` / `GENRE` 語意模糊）更合理。count 同分時用
+    名稱字母序決一，避免同一首歌每次抓到的順序不同、寫入的字串跳來跳去。
+    """
+    if not isinstance(genres, list) or not genres:
+        return None
+    candidates: list[tuple[int, str]] = []
+    for item in genres:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        count = item.get("count")
+        count = count if isinstance(count, int) else 0
+        candidates.append((count, name.strip()))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda pair: (-pair[0], pair[1]))
+    return candidates[0][1]
+
+
+def fetch_genre(release_mbid: str, *, client: httpx.Client) -> str | None:
+    """查詢一首曲目所屬 release 的 genre，收斂成單一字串。
+
+    實測結論（見 .superpowers/sdd/genre-report.md）：recording 與 release 這兩層幾乎
+    沒人力標記 genre，即使帶 `inc=genres` 也常是空的；真正有資料的是 release-group
+    這一層。一次 release lookup、`inc=genres+release-groups` 就能同時拿到 release 本身
+    與其內嵌 release-group 的 genres（MusicBrainz 會把 `genres` inc 套用到回應裡出現的
+    每個實體），不必為了 release-group 再多打一支 API。優先採 release-group 的結果，
+    release 本身幾乎必空但仍當退路檢查一次。
+
+    只使用 genres（受控詞彙），不退回 tags（自由標記）：實測樣本中沒有一個案例是
+    「genres 空但 tags 有料」——recording／release 這兩層兩者一起空，release-group／
+    artist 這兩層兩者一起有料，tags 沒有多覆蓋到 genres 覆蓋不到的案例，卻會多帶進
+    非類型的雜訊詞（年代、心情、其他自由標籤）。
+
+    只在 Pipeline.finalize() 對使用者確認的那一首呼叫，不在 search() 比對階段對每個
+    候選呼叫（1.1 秒節流 × 最多 3 個候選 = 比對延遲變 4 倍，划不來換一個比對階段
+    用不到的欄位）。
+
+    行為比照 fetch_cover()：任何失敗（HTTP 錯誤、回應形狀不符）原樣冒出例外，由
+    呼叫端（Pipeline._fetch_genre）決定要不要吞掉——genre 查詢失敗不該讓整首曲目
+    下載失敗。
+    """
+    _throttle()
+    response = client.get(
+        f"{WS_BASE}/release/{release_mbid}",
+        params={"fmt": "json", "inc": "genres+release-groups"},
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise MusicBrainzError("回應不是預期的物件結構")
+
+    release_group = payload.get("release-group")
+    genres = release_group.get("genres") if isinstance(release_group, dict) else None
+    genre = _top_genre(genres)
+    if genre is not None:
+        return genre
+    return _top_genre(payload.get("genres"))
 
 
 def to_track_meta(recording: dict) -> TrackMeta:

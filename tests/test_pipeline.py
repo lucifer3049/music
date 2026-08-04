@@ -7,7 +7,7 @@ from app.config import LibraryRoots
 from app.jobs.store import JobStore, TrackStatus
 from app.models import SourceTrack, TrackMeta
 from app.pipeline import Pipeline, fallback_meta
-from app.sources import youtube
+from app.sources import musicbrainz, youtube
 from app.sources.youtube import DownloadedStreams
 
 
@@ -320,3 +320,95 @@ def test_finalize_skips_cover_when_no_cover_url(pipeline):
 
     assert calls == []
     assert pipeline.store.get_track(track.id).status == TrackStatus.DONE
+
+
+# --- genre：只在 finalize() 對使用者確認的那一首查，不在 search() 比對階段查 ---
+
+_REAL_RELEASE_MBID = "1e14b2d6-8652-3dcc-b60b-4fb5fe79e024"
+
+
+def _meta_with_real_cover(**over):
+    """cover_url 用 musicbrainz.cover_url_for_release() 組出，
+    genre_fn 才拆得出 release MBID（見 release_mbid_for_genre_lookup()）。"""
+    over.setdefault("cover_url", musicbrainz.cover_url_for_release(_REAL_RELEASE_MBID))
+    return _meta(**over)
+
+
+def test_finalize_fills_genre_for_confirmed_candidate(pipeline):
+    """使用者確認的候選沒有 genre 時，finalize() 要去查一次並寫進實際落地的標籤。"""
+    job_id = pipeline.submit("https://music.youtube.com/watch?v=v1")
+    track = pipeline.store.get_job(job_id).tracks[0]
+    pipeline.store.confirm(track.id, _meta_with_real_cover())
+
+    calls = []
+
+    def fake_genre_fn(release_mbid, *, client):
+        calls.append(release_mbid)
+        return "hard rock"
+
+    pipeline._genre_fn = fake_genre_fn
+    pipeline.finalize(track.id)
+
+    assert calls == [_REAL_RELEASE_MBID]
+    assert pipeline.store.get_track(track.id).status == TrackStatus.DONE
+    assert all(meta.genre == "hard rock" for _, meta, _ in pipeline.written)
+
+
+def test_finalize_leaves_genre_none_when_lookup_finds_nothing(pipeline):
+    """release-group 沒有 genre 資料（實測常見案例）時，genre_fn 回 None，
+    寫入的標籤也該是 None，不能編造一個假類型。"""
+    job_id = pipeline.submit("https://music.youtube.com/watch?v=v1")
+    track = pipeline.store.get_job(job_id).tracks[0]
+    pipeline.store.confirm(track.id, _meta_with_real_cover())
+
+    pipeline._genre_fn = lambda release_mbid, *, client: None
+    pipeline.finalize(track.id)
+
+    assert pipeline.store.get_track(track.id).status == TrackStatus.DONE
+    assert all(meta.genre is None for _, meta, _ in pipeline.written)
+
+
+def test_finalize_survives_genre_lookup_failure(pipeline):
+    """genre 查詢失敗不算致命錯誤（比照封面圖的既有慣例）—— 沒查到 genre 的歌
+    還是要能下載完成，不能整首曲目變成 FAILED。"""
+    job_id = pipeline.submit("https://music.youtube.com/watch?v=v1")
+    track = pipeline.store.get_job(job_id).tracks[0]
+    pipeline.store.confirm(track.id, _meta_with_real_cover())
+
+    def boom(release_mbid, *, client):
+        raise httpx.HTTPError("503")
+
+    pipeline._genre_fn = boom
+    pipeline.finalize(track.id)
+
+    final = pipeline.store.get_track(track.id)
+    assert final.status == TrackStatus.DONE
+    assert all(meta.genre is None for _, meta, _ in pipeline.written)
+
+
+def test_finalize_skips_genre_lookup_when_no_release_mbid(pipeline):
+    """cover_url 不是 cover_url_for_release() 組出的形狀（例如 fallback_meta 或
+    測試替身塞的假網址）時，沒有 release MBID 可查，不該打任何請求。"""
+    job_id = pipeline.submit("https://music.youtube.com/watch?v=v1")
+    track = pipeline.store.get_job(job_id).tracks[0]
+    pipeline.store.confirm(track.id, _meta())  # 預設 cover_url 是假網址
+
+    calls = []
+    pipeline._genre_fn = lambda release_mbid, *, client: calls.append(release_mbid) or "rock"
+    pipeline.finalize(track.id)
+
+    assert calls == []
+    assert all(meta.genre is None for _, meta, _ in pipeline.written)
+
+
+def test_submit_never_looks_up_genre_during_matching(pipeline):
+    """genre 查詢決策（genre-report.md Step 2）：只在使用者確認候選、真的要
+    下載那一首時才查，不在 search() 比對階段對每個候選都查——否則比對延遲
+    乘上候選數。submit() 全程不該碰 genre_fn。候選要用真實形狀的 cover_url，
+    不然即使 _match_one 誤呼叫 genre 查詢，也會被 release_mbid 解析失敗擋掉，
+    測不出這條規則。"""
+    pipeline._search_fn = lambda q, client: [_meta_with_real_cover()]
+    calls = []
+    pipeline._genre_fn = lambda release_mbid, *, client: calls.append(release_mbid) or "rock"
+    pipeline.submit("https://music.youtube.com/watch?v=v1")
+    assert calls == []

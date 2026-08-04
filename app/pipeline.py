@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import shutil
+from dataclasses import replace
 from pathlib import Path
 
 from app.config import LibraryRoots
@@ -35,7 +36,12 @@ _JPEG_MAGIC = b"\xff\xd8"
 
 
 def fallback_meta(source: SourceTrack) -> TrackMeta:
-    """MusicBrainz 查無結果時，用 YouTube 自身資料組出堪用標籤。"""
+    """MusicBrainz 查無結果時，用 YouTube 自身資料組出堪用標籤。
+
+    genre 維持 None：genre 只能查 MusicBrainz release-group（見
+    musicbrainz.fetch_genre()），這條路徑根本沒有 MusicBrainz release 可查，
+    沒有來源可補，不是遺漏。
+    """
     if source.track:
         title = source.track
         artist = source.artist
@@ -74,6 +80,7 @@ class Pipeline:
         search_fn=musicbrainz.search,
         download_fn=youtube.download_streams,
         cover_fn=musicbrainz.fetch_cover,
+        genre_fn=musicbrainz.fetch_genre,
         write_fn=write_tags,
     ) -> None:
         self.store = store
@@ -84,6 +91,7 @@ class Pipeline:
         self._search_fn = search_fn
         self._download_fn = download_fn
         self._cover_fn = cover_fn
+        self._genre_fn = genre_fn
         self._write_fn = write_fn
 
     def submit(self, url: str) -> int:
@@ -156,6 +164,10 @@ class Pipeline:
 
             self.store.set_status(track_id, TrackStatus.TAGGING)
             cover = self._fetch_cover(meta)
+            if meta.genre is None:
+                genre = self._fetch_genre(meta)
+                if genre:
+                    meta = replace(meta, genre=genre)
             # 先在 workdir 就地標籤，成功了才搬進 Music/Archive —— 檔案只有
             # 「完整標籤過」才能進圖書館；標籤失敗絕不能留下未標記、但檔名／
             # 路徑看起來完全正常的檔案在使用者的真實收藏裡（Task 10 review
@@ -199,3 +211,22 @@ class Pipeline:
         if not _looks_like_jpeg(data):
             return None
         return data
+
+    def _fetch_genre(self, meta: TrackMeta) -> str | None:
+        """genre 查詢失敗不算致命錯誤 —— 查不到 genre 的歌還是要能下載完成。
+
+        只在使用者確認候選、真的要下載那一首時才查（見
+        musicbrainz.fetch_genre() 的說明與 genre-report.md Step 2 的延遲成本
+        量測），不在 search() 比對階段對每個候選都查。release MBID 從
+        cover_url 反推（TrackMeta 不能新增欄位，見
+        musicbrainz.release_mbid_for_genre_lookup() 的說明），沒有 cover_url
+        就沒有 release 可查，直接回 None，不用打任何請求。
+        """
+        release_mbid = musicbrainz.release_mbid_for_genre_lookup(meta)
+        if not release_mbid:
+            return None
+        try:
+            with self._client_factory() as client:
+                return self._genre_fn(release_mbid, client=client)
+        except Exception:
+            return None

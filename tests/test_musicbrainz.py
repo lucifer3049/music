@@ -12,7 +12,9 @@ from app.sources.musicbrainz import (
     MusicBrainzError,
     cover_url_for_release,
     fetch_cover,
+    fetch_genre,
     make_client,
+    release_mbid_for_genre_lookup,
     search,
     search_recordings,
     to_track_meta,
@@ -256,3 +258,91 @@ def test_fetch_cover_raises_on_missing_art():
     with httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(404))) as client:
         with pytest.raises(httpx.HTTPStatusError):
             fetch_cover("https://coverartarchive.org/release/x/front-500", client=client)
+
+
+# --- release_mbid_for_genre_lookup ---
+
+
+def test_release_mbid_for_genre_lookup_extracts_from_cover_url():
+    """cover_url 是 cover_url_for_release() 組出來的，release MBID 原樣編在裡面。"""
+    meta = to_track_meta(_first_recording())
+    release_mbid = release_mbid_for_genre_lookup(meta)
+    assert release_mbid is not None
+    assert meta.cover_url == cover_url_for_release(release_mbid)
+
+
+def test_release_mbid_for_genre_lookup_returns_none_without_cover_url():
+    """單曲沒有所屬 release（cover_url 為 None）時，沒有 release-group 可查。"""
+    recording = {"id": "x", "title": "孤兒曲", "artist-credit": [{"name": "某人"}]}
+    meta = to_track_meta(recording)
+    assert meta.cover_url is None
+    assert release_mbid_for_genre_lookup(meta) is None
+
+
+def test_release_mbid_for_genre_lookup_returns_none_for_unrelated_url():
+    """不是 cover_url_for_release() 組出來的網址（例如測試替身塞的假網址）
+    不該被誤判成能拆解出 release MBID。"""
+    from dataclasses import replace
+
+    meta = replace(to_track_meta(_first_recording()), cover_url="https://i.kfs.io/x/cover.jpg")
+    assert release_mbid_for_genre_lookup(meta) is None
+
+
+# --- fetch_genre ---
+
+
+def test_fetch_genre_sends_required_params():
+    """genre 資料在 release-group 這一層，一次 release lookup 帶
+    inc=genres+release-groups 就能同時拿到兩層，不必分兩支 API。"""
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        return httpx.Response(200, json=_fixture("mb_release_genres.json"))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        fetch_genre("1e14b2d6-8652-3dcc-b60b-4fb5fe79e024", client=client)
+
+    assert "fmt=json" in captured["url"]
+    assert "inc=genres%2Brelease-groups" in captured["url"]
+    assert "1e14b2d6-8652-3dcc-b60b-4fb5fe79e024" in captured["url"]
+
+
+def test_fetch_genre_returns_top_voted_genre():
+    """實際 fixture（Queen《A Night at the Opera》)裡 hard rock（count 18）
+    票數最高，取票數最高者，不是回應陣列的第一筆。"""
+    with httpx.Client(
+        transport=httpx.MockTransport(
+            lambda r: httpx.Response(200, json=_fixture("mb_release_genres.json"))
+        )
+    ) as client:
+        genre = fetch_genre("1e14b2d6-8652-3dcc-b60b-4fb5fe79e024", client=client)
+    assert genre == "hard rock"
+
+
+def test_fetch_genre_returns_none_when_release_group_has_no_genres():
+    """release-group.genres 是空陣列（實測常見案例，見 genre-report.md）時回 None，
+    不得拋出。"""
+    with httpx.Client(
+        transport=httpx.MockTransport(
+            lambda r: httpx.Response(200, json=_fixture("mb_release_genres_empty.json"))
+        )
+    ) as client:
+        genre = fetch_genre("2a5f9486-48b5-4634-94ab-8e2223586164", client=client)
+    assert genre is None
+
+
+def test_fetch_genre_raises_on_http_error():
+    """行為比照 fetch_cover()：底層失敗原樣冒出，由呼叫端（Pipeline._fetch_genre）
+    決定要不要吞掉。"""
+    with httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(503))) as client:
+        with pytest.raises(httpx.HTTPStatusError):
+            fetch_genre("x", client=client)
+
+
+def test_fetch_genre_raises_on_malformed_payload():
+    with httpx.Client(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json=[1, 2, 3]))
+    ) as client:
+        with pytest.raises(MusicBrainzError):
+            fetch_genre("x", client=client)

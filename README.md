@@ -11,6 +11,7 @@
 - 原設計以 KKBOX 為 metadata 來源，實作時發現其專輯與歌曲頁已由 AWS WAF 攔截程式化存取（HTTP 202、`x-amzn-waf-action: challenge`、回應零位元組），繞過機器人驗證不在選項內，因此改用 **MusicBrainz** 公開 API，封面圖取自 **Cover Art Archive**。
 - YouTube Music 沒有無損來源。本工具**不重新編碼**，音訊串流原封落檔（m4a 走 remux 容器包裝、opus 走 `-c:a copy`），只是把來源給的東西存起來。
 - MusicBrainz 對冷門或非西方語系的發行版收錄不如串流平台完整；查無結果或候選不準時，靠下載前的人工確認畫面手動修正（見「使用流程」）。
+- Genre 資料實測只存在於 MusicBrainz 的 release-group 這一層（recording／release 這兩層幾乎都拿不到），額外查一次要多打一支 API、有節流延遲成本，因此只在使用者確認候選、真的要下載那一首時才查（`Pipeline.finalize()`），不在比對階段對每個候選都查。西洋主流專輯通常查得到，華語／非西方或冷門專輯常態性是空的——這是 MusicBrainz 資料覆蓋率的限制，不是程式漏抓（詳見 `.superpowers/sdd/genre-report.md`）。
 
 ## 需求
 
@@ -58,7 +59,7 @@
 1. 貼上網址（支援單曲、專輯、播放清單，一行一個）
 2. 系統探測曲目並向 MusicBrainz 查詢候選標籤，停在「待確認」
 3. 逐首確認或修改標籤後按「確認並下載」（或「跳過」）
-4. 下載、寫標籤、落檔
+4. 下載、查 genre（若確認的候選沒有 genre）、寫標籤、落檔
 
 已下載完成（`done`）過的 videoId 再次送出會自動標記為「已跳過」；失敗（`failed`）或其他未完成狀態的曲目不算重複，可以重新處理。
 
@@ -70,7 +71,7 @@
 
     .venv\Scripts\python.exe -m pytest -q
 
-目前共 166 個測試，全部使用 fixture 與 mock，不對 MusicBrainz 或 YouTube 發出任何真實請求。
+目前共 179 個測試，全部使用 fixture 與 mock，不對 MusicBrainz 或 YouTube 發出任何真實請求。
 
 ## 疑難排解
 
@@ -78,6 +79,7 @@
 |---|---|
 | 啟動就報 ffmpeg 錯誤（`FfmpegMissingError`） | ffmpeg 不在 PATH。`app/main.py` 在 import 階段就檢查，裝好後需重開終端機讓 PATH 生效 |
 | 候選標籤明顯配錯，或全部很低分 | MusicBrainz 查無結果時會降級用 YouTube 自身資料（分數 0），仍可下載；未設定 `MUSICBRAINZ_CONTACT` 也可能讓請求被拒而觸發降級。冷門或非西方語系的發行版本來就收錄較薄，這正是「待確認」畫面存在的目的——手動改標籤即可 |
+| 下載完的檔案 Genre 欄位是空的 | 預期行為（多數情況）。MusicBrainz 的 genre 資料只存在於 release-group 這一層，而且完全仰賴社群標記；西洋主流專輯通常有資料，華語／非西方或冷門專輯常態性沒有人標記，此時就是空的，不是程式漏抓。降級路徑（查無 MusicBrainz 結果、用 YouTube 自身資料組標籤）沒有 MusicBrainz release 可查，genre 一定是空的 |
 | `Archive/` 底下的 opus 檔案，檔案總管內容面板看不到任何標籤 | 預期行為，不是 bug。Windows 檔案總管不讀 Opus 標籤。改用 foobar2000、MusicBee 或 VLC 檢視；`Music/` 底下的 m4a 檔案沒有這個問題 |
 | 曲目狀態卡在「failed」 | 展開錯誤訊息。常見於影片下架或地區限制而無法下載，其餘情況可重新送出同一個網址重試 |
 | 點「確認並下載」或「跳過」沒反應、出現錯誤 | 後端回 409，代表這首曲目已經不在「待確認」狀態（可能已被確認、正在下載或已完成）。重新整理頁面確認目前狀態 |
