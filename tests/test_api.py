@@ -516,6 +516,112 @@ async def test_confirm_background_exception_is_logged(tmp_path, caplog):
     pipeline.store.close()
 
 
+# --- 刪除任務 / 清除已完成紀錄 ---
+
+
+async def test_delete_job_removes_it(client, app_and_pipeline):
+    _, pipeline = app_and_pipeline
+    job_id = (await client.post(
+        "/api/jobs", json={"urls": ["https://music.youtube.com/watch?v=v1"]}
+    )).json()["job_ids"][0]
+
+    response = await client.delete(f"/api/jobs/{job_id}")
+    assert response.status_code == 200
+    assert response.json() == {"deleted": True}
+    assert pipeline.store.get_job(job_id) is None
+
+
+async def test_delete_job_404(client):
+    response = await client.delete("/api/jobs/99999")
+    assert response.status_code == 404
+
+
+async def test_delete_job_rejects_track_in_flight(tmp_path):
+    """曲目正在 DOWNLOADING／TAGGING 時，背景執行緒還在寫 store 與檔案系統，
+    這時把 job 刪掉，那個背景 thread 之後的每一次 store 寫入都會操作在一個
+    已經不存在的 job_id 上（cascade 早把 track 列也刪了），是資料損毀的
+    寫入孤兒資料 —— 必須先擋下來，跟 confirm／skip 對非 awaiting_confirm
+    曲目回 409 是同一個道理（見 test_confirm_rejects_track_already_downloading）。"""
+    gate = threading.Event()
+
+    def gated_download(video_id, workdir, **kwargs):
+        gate.wait(timeout=5)
+        return _fake_download(video_id, workdir, **kwargs)
+
+    pipeline = _build_pipeline(tmp_path, download_fn=gated_download)
+    app = create_app(pipeline)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        job_id = (await c.post(
+            "/api/jobs", json={"urls": ["https://music.youtube.com/watch?v=v1"]}
+        )).json()["job_ids"][0]
+        track_id = pipeline.store.get_job(job_id).tracks[0].id
+
+        confirm_resp = await c.post(f"/api/tracks/{track_id}/confirm", json={"meta": META_PAYLOAD})
+        assert confirm_resp.status_code == 200
+        assert pipeline.store.get_track(track_id).status == TrackStatus.DOWNLOADING
+
+        delete_resp = await c.delete(f"/api/jobs/{job_id}")
+        assert delete_resp.status_code == 409
+        assert TrackStatus.DOWNLOADING.value in delete_resp.json()["detail"]
+        # 沒被真的刪掉
+        assert pipeline.store.get_job(job_id) is not None
+
+        gate.set()
+        await _wait_for(pipeline, track_id, TrackStatus.DONE)
+        await asyncio.sleep(0)  # 讓 done_callback 有機會跑，避免懸掛的背景 task
+    pipeline.store.close()
+
+
+async def test_delete_job_allowed_once_track_reaches_terminal_status(client, app_and_pipeline):
+    """跟上面相反的情境：曲目已經跑完（DONE），這時刪除必須放行——不能因為
+    這個 job 曾經有過背景工作就永遠鎖死。"""
+    _, pipeline = app_and_pipeline
+    job_id = (await client.post(
+        "/api/jobs", json={"urls": ["https://music.youtube.com/watch?v=v1"]}
+    )).json()["job_ids"][0]
+    track_id = pipeline.store.get_job(job_id).tracks[0].id
+    await client.post(f"/api/tracks/{track_id}/confirm", json={"meta": META_PAYLOAD})
+    await _wait_for(pipeline, track_id, TrackStatus.DONE)
+
+    response = await client.delete(f"/api/jobs/{job_id}")
+    assert response.status_code == 200
+    assert pipeline.store.get_job(job_id) is None
+
+
+async def test_clear_finished_jobs_returns_deleted_count(client, app_and_pipeline):
+    _, pipeline = app_and_pipeline
+    job_id = (await client.post(
+        "/api/jobs", json={"urls": ["https://music.youtube.com/watch?v=v1"]}
+    )).json()["job_ids"][0]
+    track_id = pipeline.store.get_job(job_id).tracks[0].id
+    await client.post(f"/api/tracks/{track_id}/confirm", json={"meta": META_PAYLOAD})
+    await _wait_for(pipeline, track_id, TrackStatus.DONE)
+
+    response = await client.post("/api/jobs/clear-finished")
+    assert response.status_code == 200
+    assert response.json() == {"deleted": 1}
+    assert pipeline.store.get_job(job_id) is None
+
+
+async def test_clear_finished_jobs_leaves_populating_job_alone(client, app_and_pipeline):
+    """探測還沒完成（沒有 track、沒有 job.error）的 job 不能被清掉——見
+    JobStore.delete_finished_jobs() 的說明。"""
+    _, pipeline = app_and_pipeline
+    job_id = (await client.post(
+        "/api/jobs", json={"urls": ["https://music.youtube.com/watch?v=v1"]}
+    )).json()["job_ids"][0]
+    track_id = pipeline.store.get_job(job_id).tracks[0].id
+    # 手動把唯一的 track 撥回非終態，模擬「job 還在跑」，不牽動 delete_finished_jobs
+    # 判斷 job 是否完成的邏輯本身（那部分已經在 test_store.py 覆蓋過）。
+    pipeline.store.set_status(track_id, TrackStatus.DOWNLOADING)
+
+    response = await client.post("/api/jobs/clear-finished")
+    assert response.status_code == 200
+    assert response.json() == {"deleted": 0}
+    assert pipeline.store.get_job(job_id) is not None
+
+
 async def _wait_for(pipeline, track_id, status, timeout=5.0):
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:

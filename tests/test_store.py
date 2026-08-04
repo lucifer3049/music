@@ -230,6 +230,101 @@ def test_create_job_concurrent_ids_map_to_correct_url(store):
         )
 
 
+def test_delete_job_removes_job(store):
+    job_id = store.create_job("u")
+    assert store.delete_job(job_id) is True
+    assert store.get_job(job_id) is None
+
+
+def test_delete_job_missing_returns_false(store):
+    assert store.delete_job(99999) is False
+
+
+def test_delete_job_cascades_to_tracks(store):
+    """ON DELETE CASCADE 只是 schema 宣告，實際生不生效取決於這個連線的
+    PRAGMA foreign_keys 是不是真的開著（sqlite3 預設關閉，需要每個連線自己
+    開）。這裡直接驗證刪 job 之後，底下的 track *列* 也從資料表消失
+    （不是只有 job.tracks 因為 join 不到而看起來是空的——用 get_track()
+    直接查 track 表本身）。"""
+    job_id = store.create_job("u")
+    track_id = store.add_track(job_id, _source())
+    other_job_id = store.create_job("u2")
+    other_track_id = store.add_track(other_job_id, _source("v-other"))
+
+    assert store.delete_job(job_id) is True
+
+    assert store.get_track(track_id) is None
+    # 其他 job 底下的 track 不該被殃及
+    assert store.get_track(other_track_id) is not None
+
+
+def test_delete_finished_jobs_leaves_still_populating_job_alone(store):
+    """job 剛建立、submit() 還在跑（還沒補上任何 track），既沒有 track 也
+    沒有 job.error。這種 job 不算「已完成」，清除已完成紀錄不該動到它——
+    否則等於刪掉一個還在探測中的任務。"""
+    job_id = store.create_job("u")
+    deleted = store.delete_finished_jobs()
+    assert deleted == 0
+    assert store.get_job(job_id) is not None
+
+
+def test_delete_finished_jobs_removes_job_with_error(store):
+    job_id = store.create_job("u")
+    store.set_job_error(job_id, "地區限制")
+    deleted = store.delete_finished_jobs()
+    assert deleted == 1
+    assert store.get_job(job_id) is None
+
+
+def test_delete_finished_jobs_removes_job_with_all_terminal_tracks(store):
+    job_id = store.create_job("u")
+    done_id = store.add_track(job_id, _source("v-done"))
+    store.set_status(done_id, TrackStatus.DONE)
+    failed_id = store.add_track(job_id, _source("v-failed"))
+    store.set_status(failed_id, TrackStatus.FAILED, error="下架")
+    skipped_id = store.add_track(job_id, _source("v-skipped"))
+    store.set_status(skipped_id, TrackStatus.SKIPPED)
+
+    deleted = store.delete_finished_jobs()
+    assert deleted == 1
+    assert store.get_job(job_id) is None
+
+
+def test_delete_finished_jobs_leaves_job_with_in_progress_track(store):
+    job_id = store.create_job("u")
+    done_id = store.add_track(job_id, _source("v-done"))
+    store.set_status(done_id, TrackStatus.DONE)
+    downloading_id = store.add_track(job_id, _source("v-downloading"))
+    store.set_status(downloading_id, TrackStatus.DOWNLOADING)
+
+    deleted = store.delete_finished_jobs()
+    assert deleted == 0
+    assert store.get_job(job_id) is not None
+
+
+def test_delete_finished_jobs_only_removes_matching_jobs_and_counts_correctly(store):
+    finished_id = store.create_job("finished")
+    t = store.add_track(finished_id, _source("v-a"))
+    store.set_status(t, TrackStatus.DONE)
+
+    populating_id = store.create_job("populating")
+
+    in_progress_id = store.create_job("in-progress")
+    t2 = store.add_track(in_progress_id, _source("v-b"))
+    store.set_status(t2, TrackStatus.TAGGING)
+
+    errored_id = store.create_job("errored")
+    store.set_job_error(errored_id, "無法取得任何曲目")
+
+    deleted = store.delete_finished_jobs()
+
+    assert deleted == 2
+    assert store.get_job(finished_id) is None
+    assert store.get_job(errored_id) is None
+    assert store.get_job(populating_id) is not None
+    assert store.get_job(in_progress_id) is not None
+
+
 def test_add_track_concurrent_ids_map_to_correct_video(store):
     """跟上面同一個 lastrowid 競速問題，但換成同一個 job 底下並行 add_track。"""
     job_id = store.create_job("https://music.youtube.com/watch?v=parent")

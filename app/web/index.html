@@ -19,12 +19,22 @@ https://music.youtube.com/playlist?list=OLAK5uy_..."></textarea>
     <span id="submit-status"></span>
   </section>
 
+  <section class="history-actions">
+    <button id="clear-finished">清除已完成紀錄</button>
+    <span id="clear-finished-status"></span>
+    <p class="hint">刪除任務或清除紀錄只清掉這份清單，不會刪除已下載的檔案，也會一併清掉防止重複下載的紀錄——之後重新送出同一個網址會重新下載一次。</p>
+  </section>
+
   <section id="jobs"></section>
 
   <template id="job-template">
     <div class="job">
-      <h2 class="job-title"></h2>
+      <div class="job-head">
+        <h2 class="job-title"></h2>
+        <button class="delete-job">刪除任務</button>
+      </div>
       <p class="job-error"></p>
+      <p class="job-action-error"></p>
       <div class="tracks"></div>
     </div>
   </template>
@@ -35,6 +45,7 @@ https://music.youtube.com/playlist?list=OLAK5uy_..."></textarea>
         <span class="raw-title"></span>
         <span class="status"></span>
       </div>
+      <a class="youtube-link" target="_blank" rel="noopener noreferrer" hidden></a>
       <div class="candidates"></div>
       <fieldset class="edit-fields">
         <legend>標籤內容（可修改後再確認）</legend>

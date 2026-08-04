@@ -207,6 +207,53 @@ class JobStore:
                 (message, job_id),
             )
 
+    def delete_job(self, job_id: int) -> bool:
+        """刪除一筆 job。回傳是否真的刪到一列（job_id 不存在時回傳 False）。
+
+        底下的 track 列不用另外手動刪：schema 宣告 `tracks.job_id` 帶
+        `ON DELETE CASCADE`（見 `_SCHEMA`），而這個連線在 `__init__` 已經
+        執行 `PRAGMA foreign_keys = ON`——sqlite3 這個 pragma 是「連線層級」
+        設定、預設關閉，且必須由呼叫端自己開，不會因為 schema 寫了
+        `ON DELETE CASCADE` 就自動生效。這裡不是假設它有效，而是已經用
+        `tests/test_store.py::test_delete_job_cascades_to_tracks` 實際驗證
+        過：刪 job 之後直接查 tracks 表，底下的 track 列確實一併消失，不是
+        只有透過 join 撈不到而已。
+        """
+        with self._write_lock:
+            cursor = self._conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+            return cursor.rowcount > 0
+
+    _TERMINAL_TRACK_STATUSES = (TrackStatus.DONE, TrackStatus.FAILED, TrackStatus.SKIPPED)
+
+    def delete_finished_jobs(self) -> int:
+        """刪掉所有「已經沒有事情要做」的 job，回傳刪除筆數。
+
+        符合條件的 job：
+          - 底下所有曲目都到達終態（done/failed/skipped），或
+          - job 本身帶著 job 層級錯誤（探測整批失敗，`job.tracks` 必然是
+            空陣列，見 `set_job_error`）。
+
+        沒有曲目、也沒有 job 層級錯誤的 job，代表 `submit()` 還在跑、稍後
+        會補上曲目——絕不能刪。這裡刻意寫成 `job.tracks and all(...)` 而不是
+        單純 `all(...)`：對空陣列呼叫 `all()` 會回傳 True（vacuous truth），
+        若不加 `job.tracks` 這個前置判斷，一個曲目還沒補齊的 job 會被誤判成
+        「全部曲目都終結」而被刪掉——這跟 `app/api/routes.py` 的
+        `job_events()` 要防的是同一個陷阱，該處的說明有更完整的推導。
+        """
+        jobs = self.list_jobs()
+        ids = [
+            job.id
+            for job in jobs
+            if job.error is not None
+            or (job.tracks and all(t.status in self._TERMINAL_TRACK_STATUSES for t in job.tracks))
+        ]
+        if not ids:
+            return 0
+        placeholders = ", ".join("?" for _ in ids)
+        with self._write_lock:
+            cursor = self._conn.execute(f"DELETE FROM jobs WHERE id IN ({placeholders})", ids)
+            return cursor.rowcount
+
     # --- 讀取 ---
 
     def _row_to_track(self, row: sqlite3.Row) -> TrackRow:

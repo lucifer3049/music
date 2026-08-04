@@ -30,7 +30,11 @@ button:disabled { opacity: 0.4; cursor: default; }
 .submit { display: flex; flex-wrap: wrap; align-items: center; gap: var(--gap); margin-top: var(--gap); }
 .submit textarea { flex: 1 1 100%; }
 
+.history-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--gap); margin-top: var(--gap); }
+.history-actions .hint { flex: 1 1 100%; margin: 4px 0 0; }
+
 .job { border-top: 1px solid var(--border); margin-top: 24px; padding-top: 12px; }
+.job-head { display: flex; justify-content: space-between; align-items: baseline; gap: var(--gap); }
 .job-title { font-size: 1.05em; word-break: break-all; }
 
 .track {
@@ -47,6 +51,17 @@ button:disabled { opacity: 0.4; cursor: default; }
 .status[data-status="done"] { color: seagreen; }
 .status[data-status="failed"] { color: crimson; }
 .status[data-status="skipped"] { opacity: 0.5; }
+
+.youtube-link {
+  display: block;
+  font-size: 0.78em;
+  opacity: 0.6;
+  word-break: break-all;
+  margin-top: 2px;
+  color: inherit;
+}
+.youtube-link:hover { opacity: 0.9; }
+.youtube-link[hidden] { display: none; }
 
 .candidates { display: grid; gap: 8px; margin: var(--gap) 0; }
 
@@ -95,9 +110,9 @@ button:disabled { opacity: 0.4; cursor: default; }
 
 .actions { display: flex; gap: 8px; }
 
-.error, .action-error, .job-error {
+.error, .action-error, .job-error, .job-action-error {
   color: crimson;
   font-size: 0.85em;
   margin: 4px 0 0;
 }
-.error:empty, .action-error:empty, .job-error:empty { display: none; }
+.error:empty, .action-error:empty, .job-error:empty, .job-action-error:empty { display: none; }

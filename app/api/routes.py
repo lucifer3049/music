@@ -174,6 +174,41 @@ def create_app(pipeline: Pipeline) -> FastAPI:
         pipeline.store.set_status(track_id, TrackStatus.SKIPPED)
         return {"status": TrackStatus.SKIPPED.value}
 
+    @app.delete("/api/jobs/{job_id}")
+    async def delete_job(job_id: int) -> dict:
+        job = pipeline.store.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="找不到任務")
+        # 曲目在 DOWNLOADING／TAGGING 時，背景執行緒還在寫 store 與檔案系統
+        # （見 Pipeline.finalize()）。這時把 job（連同 cascade 掉的 track
+        # 列）刪掉，那個還在跑的背景 thread 之後每一次 store 寫入都會打在
+        # 一個已經不存在的 track_id 上——不是致命錯誤（set_status 對不存在
+        # 的 id 只是 no-op），但下載到一半的檔案會變成沒有任何 job/track
+        # 紀錄能對應到的孤兒，使用者也完全看不到它何時完成或失敗。跟
+        # confirm／skip 對非 awaiting_confirm 曲目回 409 是同一個道理：
+        # 先擋下有背景工作在飛的狀態，讓使用者等它跑完（或看到最終結果）
+        # 再刪。
+        in_flight = next(
+            (t for t in job.tracks if t.status in (TrackStatus.DOWNLOADING, TrackStatus.TAGGING)),
+            None,
+        )
+        if in_flight is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"曲目目前狀態為 {in_flight.status.value}，無法刪除任務",
+            )
+        pipeline.store.delete_job(job_id)
+        return {"deleted": True}
+
+    @app.post("/api/jobs/clear-finished")
+    async def clear_finished_jobs() -> dict:
+        # delete_finished_jobs() 本身只挑「底下所有曲目都終態、或帶 job 層級
+        # 錯誤」的 job（見 JobStore.delete_finished_jobs()）——DOWNLOADING／
+        # TAGGING 都不是終態，任何一首曲目還在飛的 job 天生就不會被選中，
+        # 不需要在這裡另外重複 delete_job() 那個 409 檢查。
+        deleted = pipeline.store.delete_finished_jobs()
+        return {"deleted": deleted}
+
     @app.get("/api/jobs/{job_id}/events")
     async def job_events(job_id: int) -> StreamingResponse:
         if pipeline.store.get_job(job_id) is None:

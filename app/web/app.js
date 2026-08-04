@@ -96,6 +96,12 @@ function renderJob(job) {
     const node = jobTemplate.content.cloneNode(true);
     section = node.querySelector(".job");
     section.id = `job-${job.id}`;
+    // 監聽器只在節點第一次建立時綁一次——renderJob() 之後每輪重繪都重用
+    // 同一個 section 節點（見下方 getElementById 命中的分支），不會重新
+    // clone template，若把 addEventListener 放在這個 if 區塊外面，同一個
+    // 按鈕會被疊加綁上多個監聽器，一次點擊觸發多次刪除請求。
+    const deleteBtn = section.querySelector(".delete-job");
+    deleteBtn.addEventListener("click", () => deleteJob(deleteBtn, job.id));
     jobsEl.prepend(section);
   }
 
@@ -206,6 +212,32 @@ function renderTrack(track) {
   statusEl.dataset.status = track.status;
   article.querySelector(".error").textContent = track.error || "";
   article.querySelector(".action-error").textContent = "";
+
+  // YouTube Music「複製連結」拿到的常常是「目前正在播放」的那首，不一定是
+  // 使用者原本點開的那首（例如同一張專輯的英文版／Live 版）——把後端探測
+  // 到的來源網址亮出來，確認畫面上就能肉眼核對，而不是等下載完才發現抓錯
+  // 首（見任務說明的真實案例：「Live to Survive」vs.「Live to Survive
+  // (English version)」）。這欄只當驗證輔助、視覺上刻意比標題次要，不做
+  // 預覽播放器或縮圖。
+  //
+  // youtube_url 是遠端資料（來自 yt-dlp 探測結果），不能直接信任。用
+  // `.textContent`／`.href` 屬性賦值而非拼字串塞進 innerHTML，瀏覽器 DOM
+  // API 本身就會把內容當純文字處理，不會被解析成標籤或跑出屬性邊界——這是
+  // 比手動跳脫字元更不會出錯的做法。額外限制只有 http(s) scheme 才渲染成
+  // 可點連結：`<a href="javascript:...">` 這種格式不會被 HTML 跳脫擋下
+  // （它本來就不含跳脫字元），必須用協定白名單擋，否則使用者點下去等於在
+  // 本頁面的執行環境內跑遠端塞進來的任意程式碼。
+  const linkEl = article.querySelector(".youtube-link");
+  const youtubeUrl = track.youtube_url || "";
+  if (/^https?:\/\//i.test(youtubeUrl)) {
+    linkEl.href = youtubeUrl;
+    linkEl.textContent = youtubeUrl;
+    linkEl.hidden = false;
+  } else {
+    linkEl.hidden = true;
+    linkEl.removeAttribute("href");
+    linkEl.textContent = "";
+  }
 
   const candidatesEl = article.querySelector(".candidates");
   const selectedIndex = selections.get(track.id) ?? 0;
@@ -323,7 +355,7 @@ function confirmTrack(button, trackId, baseMeta, values) {
   const meta = buildMetaPayload(baseMeta, values);
   return postAction(
     button,
-    trackId,
+    () => document.querySelector(`[data-track-id="${trackId}"] .action-error`),
     `/api/tracks/${trackId}/confirm`,
     {
       method: "POST",
@@ -334,41 +366,122 @@ function confirmTrack(button, trackId, baseMeta, values) {
 }
 
 function skipTrack(button, trackId) {
-  return postAction(button, trackId, `/api/tracks/${trackId}/skip`, { method: "POST" });
+  return postAction(
+    button,
+    () => document.querySelector(`[data-track-id="${trackId}"] .action-error`),
+    `/api/tracks/${trackId}/skip`,
+    { method: "POST" }
+  );
 }
 
-// confirmTrack/skipTrack 共用的請求邏輯。
+function deleteJob(button, jobId) {
+  if (
+    !window.confirm(
+      "刪除這個任務？不會刪除已下載的檔案，但會清掉防止重複下載的紀錄——" +
+        "之後重新送出同一個網址會重新下載一次。"
+    )
+  ) {
+    return Promise.resolve(false);
+  }
+  return postAction(
+    button,
+    () => document.querySelector(`#job-${jobId} .job-action-error`),
+    `/api/jobs/${jobId}`,
+    { method: "DELETE" }
+  ).then((ok) => {
+    if (ok) removeJobFromView(jobId);
+    return ok;
+  });
+}
+
+// job 被刪除（單筆刪除或批次清除）之後，把畫面上對應的節點拔掉，並關閉
+// 這個 job 還開著的 EventSource——不關的話，後端 GET /api/jobs/{id}/events
+// 之後每次輪詢都會拿到 404（因為 job 沒了），而且連線本身永遠不會自己關閉
+// （見 app/api/routes.py job_events() 只在拿到 200 之後才會結束串流；
+// 已刪除的 job 在下一次查詢時直接 get_job() 回 None、迴圈就 break，但
+// 這一來一回本身就是無謂的輪詢，且發生在請求已經 404 的路徑上，不如在
+// 使用者主動刪除的當下就直接關掉，乾淨俐落）。
+function removeJobFromView(jobId) {
+  openStreams.get(jobId)?.close();
+  openStreams.delete(jobId);
+  document.getElementById(`job-${jobId}`)?.remove();
+}
+
+const clearFinishedBtn = document.getElementById("clear-finished");
+const clearFinishedStatus = document.getElementById("clear-finished-status");
+
+clearFinishedBtn.addEventListener("click", async () => {
+  if (
+    !window.confirm(
+      "清除所有已完成的任務紀錄？不會刪除已下載的檔案，但會清掉防止重複下載" +
+        "的紀錄——之後重新送出同一批網址會重新下載一次。"
+    )
+  ) {
+    return;
+  }
+  clearFinishedBtn.disabled = true;
+  clearFinishedStatus.textContent = "";
+  try {
+    const response = await fetch("/api/jobs/clear-finished", { method: "POST" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const { deleted } = await response.json();
+    clearFinishedStatus.textContent = `已清除 ${deleted} 個任務`;
+    await reconcileJobsAfterClear();
+  } catch (err) {
+    clearFinishedStatus.textContent = `清除失敗：${err.message}`;
+  } finally {
+    clearFinishedBtn.disabled = false;
+  }
+});
+
+// 批次清除只知道「刪掉了幾筆」，不知道是哪幾個 job id——重新查一次目前
+// 還活著的清單，把畫面上有、但已經不在這份清單裡的 job 節點與串流一併
+// 收掉，比在後端額外回傳整批 id 清單再逐一比對簡單。
+async function reconcileJobsAfterClear() {
+  const response = await fetch("/api/jobs");
+  const { jobs } = await response.json();
+  const liveIds = new Set(jobs.map((j) => String(j.id)));
+  document.querySelectorAll(".job").forEach((section) => {
+    const idStr = section.id.replace(/^job-/, "");
+    if (!liveIds.has(idStr)) removeJobFromView(Number(idStr));
+  });
+}
+
+// confirmTrack/skipTrack/deleteJob 共用的請求邏輯。
 //
 // SSE 每秒推一次 payload、完全不做內容比對（見 app/api/routes.py
 // job_events()），renderJob() 收到就整包 replaceChildren()，把所有曲目
 // DOM 節點連根換掉。若在使用者點擊與這個 fetch resolve 之間剛好有一次
-// 重繪，呼叫當下捕捉到的 .action-error 節點就已經被丟棄、不在文件裡了：
-// 寫進去的錯誤訊息使用者永遠看不到。409（最常見的失敗）恰好又是最容易
-// 撞上重繪的情況——「操作失敗」多半意味著別的地方剛好也改了這條曲目的
+// 重繪，呼叫當下捕捉到的錯誤節點就已經被丟棄、不在文件裡了：寫進去的
+// 錯誤訊息使用者永遠看不到。409（最常見的失敗）恰好又是最容易撞上重繪的
+// 情況——「操作失敗」多半意味著別的地方剛好也改了這條曲目／這個 job 的
 // 狀態，而那也正是會觸發重繪的事件。因此這裡不跨 await 保留 DOM 參照，
-// 只記住 track id，在要寫入的當下才重新查詢還活著的節點；查不到就代表
-// 這條曲目已經不在畫面上了，直接放棄寫入。
-async function postAction(button, trackId, url, options) {
-  const liveErrorEl = () =>
-    document.querySelector(`[data-track-id="${trackId}"] .action-error`);
-
+// 呼叫端傳一個「查詢目前還活著的錯誤節點」的函式進來，在要寫入的當下才
+// 重新呼叫它；查不到就代表這個節點已經不在畫面上了，直接放棄寫入。
+// 回傳 true／false 代表這次請求是否成功，讓 deleteJob() 之類需要「成功後
+// 才動畫面」的呼叫端可以據此決定後續動作。
+async function postAction(button, liveErrorEl, url, options) {
   const initialErrorEl = liveErrorEl();
   if (initialErrorEl) initialErrorEl.textContent = "";
 
   button.disabled = true;
   try {
     const response = await fetch(url, options);
-    // 曲目可能在使用者按下按鈕的當下已經不再是 awaiting_confirm 了
-    // （例如另一個分頁已經確認過、或已經被跳過）：後端這時回 409，
-    // 若前端不理會狀態碼，使用者會以為確認送出去了，實際上什麼都沒發生。
+    // 曲目／job 可能在使用者按下按鈕的當下已經不再符合條件了（例如另一個
+    // 分頁已經確認過、已經被跳過、或這個 job 有曲目正在下載）：後端這時
+    // 回 404／409，若前端不理會狀態碼，使用者會以為操作送出去了，實際上
+    // 什麼都沒發生。
     if (!response.ok) {
       const message = await extractErrorMessage(response);
       const el = liveErrorEl();
       if (el) el.textContent = message;
+      return false;
     }
+    return true;
   } catch (err) {
     const el = liveErrorEl();
     if (el) el.textContent = `連線失敗：${err.message}`;
+    return false;
   } finally {
     button.disabled = false;
   }
