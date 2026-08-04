@@ -156,9 +156,18 @@ class Pipeline:
 
     def _match_one(self, track_id: int, source: SourceTrack, client) -> None:
         self.store.set_status(track_id, TrackStatus.MATCHING)
-        query = " ".join(filter(None, [source.artist, source.track])) or source.raw_title
+        # 欄位限定查詢（見 musicbrainz.build_recording_query 的實測說明）。
         # musicbrainz.search() 依約定不會拋例外，故意不包 try/except。
+        query = musicbrainz.build_recording_query(
+            track=source.track, artist=source.artist, raw_title=source.raw_title
+        )
         metas = self._search_fn(query, client=client)
+
+        # 欄位限定查得精準但也嚴格：歌名或演出者的寫法與 MusicBrainz 稍有出入
+        # 就會一無所獲。查空時退回自由查詢，寧可給出幾個待人工判斷的候選，
+        # 也不要讓使用者只剩「用 YouTube 原始標籤」一途。
+        if not metas and query != source.raw_title:
+            metas = self._search_fn(source.raw_title, client=client)
 
         if metas:
             candidates = rank_candidates(source, metas)

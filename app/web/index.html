@@ -7,31 +7,65 @@
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <header>
-    <h1>音樂下載工具</h1>
-    <p class="hint">貼上 YouTube Music 網址，一行一個。標籤由 MusicBrainz 公開資料補齊，下載前可逐首確認，候選配錯或查無資料時可直接修改欄位。</p>
+  <!-- 水墨風的筆觸／落款印章：全部是內嵌 SVG，不依賴外部資產或字型 CDN
+       （這支工具跑在本機，離線也要長得一樣）。ink-edge 濾鏡用 feTurbulence
+       擾動筆畫邊緣，模擬墨在紙上暈開的毛邊。 -->
+  <svg class="svg-defs" aria-hidden="true" focusable="false">
+    <defs>
+      <filter id="ink-edge" x="-15%" y="-60%" width="130%" height="220%">
+        <feTurbulence type="fractalNoise" baseFrequency="0.03 0.085" numOctaves="3" seed="7" result="noise"/>
+        <feDisplacementMap in="SourceGraphic" in2="noise" scale="8" xChannelSelector="R" yChannelSelector="G"/>
+      </filter>
+      <filter id="seal-edge" x="-15%" y="-15%" width="130%" height="130%">
+        <feTurbulence type="fractalNoise" baseFrequency="0.14" numOctaves="4" seed="3" result="noise"/>
+        <feDisplacementMap in="SourceGraphic" in2="noise" scale="3.2" xChannelSelector="R" yChannelSelector="G"/>
+      </filter>
+    </defs>
+  </svg>
+
+  <header class="masthead">
+    <div class="masthead-text">
+      <h1>音樂下載工具</h1>
+      <svg class="brush-rule" viewBox="0 0 480 24" preserveAspectRatio="none" aria-hidden="true" focusable="false">
+        <path filter="url(#ink-edge)" d="M8 13 C 90 5 190 4 268 6 C 344 8 410 11 470 8 L 470 15 C 408 19 342 16 266 14 C 188 12 88 13 8 18 Z"/>
+      </svg>
+      <p class="hint lede">貼上 YouTube Music 網址，一行一個。標籤由 MusicBrainz 公開資料補齊，下載前可逐首確認，候選配錯或查無資料時可直接修改欄位。</p>
+    </div>
+    <svg class="seal" viewBox="0 0 64 64" aria-hidden="true" focusable="false">
+      <g filter="url(#seal-edge)">
+        <rect x="2" y="2" width="60" height="60" rx="2"/>
+        <text x="32" y="27" class="seal-glyph">音</text>
+        <text x="32" y="55" class="seal-glyph">樂</text>
+      </g>
+    </svg>
   </header>
 
-  <section class="submit">
-    <textarea id="urls" rows="4" placeholder="https://music.youtube.com/watch?v=...
+  <main>
+    <section class="submit">
+      <textarea id="urls" rows="4" placeholder="https://music.youtube.com/watch?v=...
 https://music.youtube.com/playlist?list=OLAK5uy_..."></textarea>
-    <button id="submit">送出</button>
-    <span id="submit-status"></span>
-  </section>
+      <div class="submit-bar">
+        <button id="submit" class="primary">送出</button>
+        <span id="submit-status" class="feedback"></span>
+      </div>
+    </section>
 
-  <section class="history-actions">
-    <button id="clear-finished">清除已完成紀錄</button>
-    <span id="clear-finished-status"></span>
-    <p class="hint">刪除任務或清除紀錄只清掉這份清單，不會刪除已下載的檔案，也會一併清掉防止重複下載的紀錄——之後重新送出同一個網址會重新下載一次。</p>
-  </section>
+    <section class="history-actions">
+      <div class="submit-bar">
+        <button id="clear-finished">清除已完成紀錄</button>
+        <span id="clear-finished-status" class="feedback"></span>
+      </div>
+      <p class="hint">刪除任務或清除紀錄只清掉這份清單，不會刪除已下載的檔案，也會一併清掉防止重複下載的紀錄——之後重新送出同一個網址會重新下載一次。</p>
+    </section>
 
-  <section id="jobs"></section>
+    <section id="jobs"></section>
+  </main>
 
   <template id="job-template">
     <div class="job">
       <div class="job-head">
         <h2 class="job-title"></h2>
-        <button class="delete-job">刪除任務</button>
+        <button class="delete-job quiet">刪除任務</button>
       </div>
       <p class="job-error"></p>
       <p class="job-action-error"></p>
@@ -59,7 +93,7 @@ https://music.youtube.com/playlist?list=OLAK5uy_..."></textarea>
         <label>曲風<input type="text" data-field="genre" autocomplete="off"></label>
       </fieldset>
       <div class="actions">
-        <button class="confirm">確認並下載</button>
+        <button class="confirm primary">確認並下載</button>
         <button class="skip">跳過</button>
       </div>
       <p class="error"></p>

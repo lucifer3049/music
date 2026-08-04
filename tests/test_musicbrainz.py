@@ -9,6 +9,7 @@ import pytest
 from app.models import TrackMeta
 from app.sources import musicbrainz
 from app.sources.musicbrainz import (
+    build_recording_query,
     MusicBrainzError,
     cover_url_for_release,
     fetch_cover,
@@ -346,3 +347,45 @@ def test_fetch_genre_raises_on_malformed_payload():
     ) as client:
         with pytest.raises(MusicBrainzError):
             fetch_genre("x", client=client)
+
+
+def test_build_recording_query_uses_field_qualified_syntax():
+    """歌名與演出者必須各自進欄位，不能串成一句自由查詢。
+
+    實測：`ReoNa Amore` 前三筆全是不相干的「ピルグリム -ReoNa ver.-」，
+    改成欄位限定後第一筆就是 Amore。
+    """
+    q = build_recording_query(track="Amore", artist="ReoNa", raw_title="Amore")
+    assert q == 'recording:"Amore" AND artist:"ReoNa"'
+
+
+def test_build_recording_query_without_artist():
+    q = build_recording_query(track="Amore", artist=None, raw_title="Amore")
+    assert q == 'recording:"Amore"'
+
+
+def test_build_recording_query_without_track_uses_raw_title():
+    q = build_recording_query(track=None, artist="ReoNa", raw_title="Amore (Live)")
+    assert q == 'recording:"Amore (Live)" AND artist:"ReoNa"'
+
+
+def test_build_recording_query_falls_back_to_free_text():
+    q = build_recording_query(track=None, artist=None, raw_title="某某 - 某歌")
+    assert q == "某某 - 某歌"
+
+
+def test_build_recording_query_escapes_quotes_and_backslashes():
+    """歌名含雙引號時不能讓片語提早結束，否則查詢語法整個壞掉。"""
+    bs = chr(92)  # 反斜線。用 chr() 組出預期值，避免多層字面跳脫把測試自己寫錯
+    q = build_recording_query(track='He said "hi"', artist=f"A{bs}B", raw_title="x")
+    expected = (
+        f'recording:"He said {bs}"hi{bs}""'
+        f' AND artist:"A{bs * 2}B"'
+    )
+    assert q == expected
+
+
+def test_build_recording_query_leaves_other_punctuation_alone():
+    """雙引號內的 - 與 : 本來就是字面值，多跳脫反而搜不到。"""
+    q = build_recording_query(track="ピルグリム -ReoNa ver.-", artist="ReoNa", raw_title="x")
+    assert q == 'recording:"ピルグリム -ReoNa ver.-" AND artist:"ReoNa"'

@@ -33,6 +33,7 @@ recording.length 單位是毫秒，TrackMeta.duration 是秒。
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 
@@ -277,6 +278,37 @@ def to_track_meta(recording: dict) -> TrackMeta:
         if recording.get("id")
         else None,
     )
+
+
+def _quote_phrase(value: str) -> str:
+    """把字串包成 Lucene 片語。
+
+    片語內只有反斜線與雙引號需要跳脫；其餘符號（`-`、`:`、`(` 等）在雙引號內
+    本來就是字面值，多加跳脫反而會讓 MusicBrainz 搜不到含這些字元的歌名。
+    """
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def build_recording_query(*, track: str | None, artist: str | None, raw_title: str) -> str:
+    """組出 MusicBrainz 的 recording 搜尋語句。
+
+    必須用欄位限定語法（`recording:"歌名" AND artist:"演出者"`），不能把歌名與
+    演出者用空白串成一句就丟出去 —— 後者等於要 MusicBrainz 自己猜哪個詞是什麼。
+
+    實測差異（ReoNa 的 Amore）：
+      `ReoNa Amore`                              -> 前三筆全是「ピルグリム -ReoNa ver.-」
+      `recording:"Amore" AND artist:"ReoNa"`     -> 第一筆就是 Amore
+
+    欄位缺漏時逐級退讓：只有歌名就單查歌名，兩者皆無才退回原始標題的自由查詢。
+    """
+    if track and artist:
+        return f"recording:{_quote_phrase(track)} AND artist:{_quote_phrase(artist)}"
+    if track:
+        return f"recording:{_quote_phrase(track)}"
+    if artist:
+        return f"recording:{_quote_phrase(raw_title)} AND artist:{_quote_phrase(artist)}"
+    return raw_title
 
 
 def search_recordings(

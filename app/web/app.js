@@ -4,7 +4,10 @@
 const HIGH_CONFIDENCE = 0.92;
 
 const TERMINAL_STATUSES = new Set(["done", "failed", "skipped"]);
-const BLANK_COVER = "data:image/gif;base64,R0lGODlhAQABAAAAACw=";
+// 完整的 1x1 透明 GIF。先前那串是被截斷的 GIF header，瀏覽器解不出來會
+// 退回內建的破圖示——那正是「沒有封面」時最不該出現的東西。
+const BLANK_COVER =
+  "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
 
 // 與後端 app/api/routes.py job_events() 結束串流的條件一致：job 層級探測
 // 失敗，或曲目非空且全部到達終結狀態。兩處各自判斷「這個 job 還要不要繼續

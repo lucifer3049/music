@@ -644,3 +644,70 @@ def test_workdir_left_clean_on_tagging_failure(tmp_path, keep_archive):
     assert not [p for p in leftovers if p.is_file()], f"workdir 留下殘骸：{leftovers}"
     assert not (tmp_path / "Music").exists() or not list((tmp_path / "Music").rglob("*.m4a"))
     pipe.store.close()
+
+
+def _query_capturing_pipeline(tmp_path, search_results):
+    """記錄 pipeline 實際送給 MusicBrainz 的查詢字串。
+
+    search_results 是一串回應：每次呼叫依序取用，用來模擬「第一次查空、
+    退回自由查詢才有結果」的情況。
+    """
+    store = JobStore(tmp_path / "jobs.db")
+    store.init_schema()
+    queries = []
+    responses = list(search_results)
+
+    def fake_search(query, *, client):
+        queries.append(query)
+        return responses.pop(0) if responses else []
+
+    pipe = Pipeline(
+        store,
+        LibraryRoots(music=tmp_path / "Music", archive=tmp_path / "Archive"),
+        workdir=tmp_path / "work",
+        client_factory=lambda: httpx.Client(
+            transport=httpx.MockTransport(lambda r: httpx.Response(200, content=b""))
+        ),
+        probe_fn=lambda url: [_source()],
+        search_fn=fake_search,
+        download_fn=lambda *a, **k: None,
+        cover_fn=lambda url, client: b"",
+        write_fn=lambda path, meta, cover=None: None,
+    )
+    pipe.queries = queries
+    return pipe
+
+
+def test_match_uses_field_qualified_query(tmp_path):
+    """歌名與演出者必須各進各的欄位。
+
+    實測 ReoNa 的 Amore：自由查詢 `ReoNa Amore` 前三筆全是不相干的
+    「ピルグリム -ReoNa ver.-」，欄位限定後第一筆就是 Amore。
+    """
+    pipe = _query_capturing_pipeline(tmp_path, [[_meta()]])
+    pipe.submit("https://music.youtube.com/watch?v=v1")
+
+    assert pipe.queries == ['recording:"人間驚鴻宴" AND artist:"指尖笑"']
+    pipe.store.close()
+
+
+def test_match_falls_back_to_free_text_when_qualified_query_finds_nothing(tmp_path):
+    """欄位限定查得準但也嚴格；查空時要再試一次自由查詢，別直接放棄。"""
+    pipe = _query_capturing_pipeline(tmp_path, [[], [_meta()]])
+    job_id = pipe.submit("https://music.youtube.com/watch?v=v1")
+
+    assert len(pipe.queries) == 2
+    assert pipe.queries[0].startswith("recording:")
+    assert pipe.queries[1] == _source().raw_title
+
+    track = pipe.store.get_job(job_id).tracks[0]
+    assert track.candidates[0].score > 0, "退回查詢找到的結果不該被當成未配對"
+    pipe.store.close()
+
+
+def test_match_does_not_retry_when_qualified_query_succeeds(tmp_path):
+    """有結果就不該多打一次 —— 每次查詢都要付 1.1 秒節流成本。"""
+    pipe = _query_capturing_pipeline(tmp_path, [[_meta()]])
+    pipe.submit("https://music.youtube.com/watch?v=v1")
+    assert len(pipe.queries) == 1
+    pipe.store.close()
