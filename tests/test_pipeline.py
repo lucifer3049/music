@@ -35,7 +35,7 @@ def _meta(**over) -> TrackMeta:
         track_no=1,
         track_total=1,
         genre=None,
-        cover_url="https://i.kfs.io/x/cover.jpg",
+        cover_url="https://coverartarchive.org/release/00000000-0000-0000-0000-000000000000/cover.jpg",
         duration=207,
         source_url=None,
     )

@@ -37,7 +37,7 @@ def _meta(title="人間驚鴻宴") -> TrackMeta:
         track_no=1,
         track_total=1,
         genre=None,
-        cover_url="https://i.kfs.io/x/cover.jpg",
+        cover_url="https://coverartarchive.org/release/00000000-0000-0000-0000-000000000000/cover.jpg",
         duration=207,
         source_url=None,
     )
@@ -192,12 +192,12 @@ def test_schema_is_idempotent(tmp_path):
 
 
 def test_create_job_concurrent_ids_map_to_correct_url(store):
-    """Regression test for lastrowid cross-thread misattribution.
+    """lastrowid 跨執行緒誤配的回歸測試。
 
-    sqlite3_last_insert_rowid() is a per-connection value, not per-statement.
-    If N threads INSERT concurrently on the shared connection, one thread's
-    lastrowid read can race with another thread's INSERT and return the
-    wrong id. Each returned id must map back to the job that thread created.
+    sqlite3_last_insert_rowid() 是「連線層級」而非「陳述式層級」的值。若 N 個
+    執行緒在共用連線上並行 INSERT，某個執行緒讀到的 lastrowid 可能跟另一個
+    執行緒剛完成的 INSERT 交錯，拿到錯誤的 id。每個回傳的 id 都必須對回
+    當初真正建立它的那個執行緒所送出的 job。
     """
     n = 16
     urls = [f"https://music.youtube.com/watch?v=concurrent-{i}" for i in range(n)]
@@ -231,7 +231,7 @@ def test_create_job_concurrent_ids_map_to_correct_url(store):
 
 
 def test_add_track_concurrent_ids_map_to_correct_video(store):
-    """Same lastrowid race, but for add_track under a single shared job."""
+    """跟上面同一個 lastrowid 競速問題，但換成同一個 job 底下並行 add_track。"""
     job_id = store.create_job("https://music.youtube.com/watch?v=parent")
     n = 16
     sources = [_source(f"concurrent-track-{i}") for i in range(n)]

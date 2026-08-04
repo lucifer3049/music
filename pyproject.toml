@@ -8,8 +8,6 @@ dependencies = [
     "yt-dlp>=2026.7.4",
     "mutagen>=1.47",
     "httpx>=0.28",
-    "beautifulsoup4>=4.12",
-    "lxml>=5.3",
     "rapidfuzz>=3.10",
 ]
 

@@ -1,3 +1,7 @@
+import dataclasses
+
+import pytest
+
 from app.models import Candidate, SourceTrack, TrackMeta
 
 
@@ -13,7 +17,7 @@ def _meta(**over) -> TrackMeta:
         genre=None,
         cover_url=None,
         duration=207,
-        source_url="https://www.kkbox.com/tw/tc/song/abc",
+        source_url="https://musicbrainz.org/recording/1e14b2d6-8652-3dcc-b60b-4fb5fe79e024",
     )
     base.update(over)
     return TrackMeta(**base)
@@ -30,6 +34,8 @@ def test_display_artists_single():
 
 def test_trackmeta_is_hashable_and_frozen():
     assert hash(_meta()) == hash(_meta())
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        _meta().title = "改一下"
 
 
 def test_source_track_holds_raw_title():
@@ -43,7 +49,7 @@ def test_source_track_holds_raw_title():
         album=None,
         release_year=None,
     )
-    assert st.video_id == "abc123"
+    assert st.raw_title == "【Official MV】指尖笑 - 人間驚鴻宴"
 
 
 def test_candidate_carries_score():

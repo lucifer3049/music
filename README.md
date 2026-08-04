@@ -71,7 +71,7 @@
 
     .venv\Scripts\python.exe -m pytest -q
 
-目前共 185 個測試，全部使用 fixture 與 mock，不對 MusicBrainz 或 YouTube 發出任何真實請求。
+目前共 184 個測試，全部使用 fixture 與 mock，不對 MusicBrainz 或 YouTube 發出任何真實請求。
 
 ## 疑難排解
 

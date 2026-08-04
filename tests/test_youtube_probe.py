@@ -114,7 +114,8 @@ def test_probe_album_returns_all_entries_with_order():
 
 
 def test_probe_skips_none_entries():
-    """已下架曲目在 playlist 會是 None，不能讓整批爆掉。"""
+    """已下架曲目在 playlist 會是 None，不能讓整批爆掉 —— 清單裡壞掉一首
+    不能拖垮整批，這是規格明訂的行為。"""
     info = {
         "_type": "playlist",
         "entries": [None, {"id": "b", "title": "還在的歌"}],
@@ -156,22 +157,3 @@ def test_probe_error_carries_ytdlp_message():
 
     with pytest.raises(ProbeError, match="private"):
         probe("https://music.youtube.com/watch?v=gone", ydl_factory=_LoggingYDL)
-
-
-def test_probe_playlist_with_one_dead_entry_still_succeeds():
-    """清單裡壞掉一首不能拖垮整批 —— 這是規格明訂的行為。"""
-    info = {"_type": "playlist", "entries": [None, {"id": "b", "title": "還在的歌"}]}
-
-    class _PartialYDL:
-        def __enter__(self):
-            return self
-        def __exit__(self, *exc):
-            return False
-        def extract_info(self, url, download=False):
-            return info
-
-    tracks = probe(
-        "https://music.youtube.com/playlist?list=OLAK5uy_x",
-        ydl_factory=lambda opts: _PartialYDL(),
-    )
-    assert [t.video_id for t in tracks] == ["b"]

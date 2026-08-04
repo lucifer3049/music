@@ -72,7 +72,7 @@ def _meta(**over) -> TrackMeta:
         genre=None,
         cover_url=None,
         duration=207,
-        source_url="https://www.kkbox.com/tw/tc/song/a",
+        source_url="https://musicbrainz.org/recording/1e14b2d6-8652-3dcc-b60b-4fb5fe79e024",
     )
     base.update(over)
     return TrackMeta(**base)
