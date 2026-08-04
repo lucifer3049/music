@@ -11,9 +11,11 @@
 
 from __future__ import annotations
 
+import atexit
 import logging
 import logging.handlers
 import os
+import queue
 import shutil
 import socket
 import sys
@@ -21,6 +23,9 @@ import threading
 import time
 import webbrowser
 from pathlib import Path
+
+# QueueListener 必須留著參照，否則會被回收、log 就停止寫出。
+_log_listener: logging.handlers.QueueListener | None = None
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_PORT = 8899
@@ -48,11 +53,24 @@ _FFMPEG_SYSTEM_DIRS = (
 
 
 def setup_logging() -> None:
-    """同時寫主控台與 logs/app.log。
+    """同時寫主控台與 logs/app.log，且寫出動作絕不阻塞應用程式執行緒。
 
-    主控台視窗一關就什麼都不剩，但下載是長時間作業，出事時往往已經關掉了。
-    檔案輪替上限 2 MB × 4 份，長期使用不會塞爆磁碟。
+    主控台視窗一關就什麼都不剩，但下載是長時間作業，出事時往往已經關掉了，
+    所以要有檔案。檔案輪替上限 2 MB × 4 份，長期使用不會塞爆磁碟。
+
+    為什麼一定要走 QueueHandler，不能直接掛 StreamHandler：
+    Windows 主控台的 QuickEdit 模式下，使用者只要在視窗裡點一下或選取文字，
+    輸出就會被暫停，正在寫入的執行緒就地凍結。logging 的 handler 是有鎖的，
+    被凍住的那條執行緒會一直握著鎖，於是每一條想記 log 的執行緒全部連鎖卡死
+    —— 實際發生過：下載工作執行緒卡在 emit()、主執行緒卡在 acquire()，整台
+    伺服器停止回應。
+
+    QueueHandler 讓應用程式執行緒只做「把紀錄丟進佇列」這件不會阻塞的事，
+    真正的寫出由 listener 執行緒負責。主控台被凍住時，只有 listener 停住，
+    下載與 HTTP 服務照常運作。
     """
+    global _log_listener
+
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     formatter = logging.Formatter(
         "%(asctime)s %(levelname)-7s %(name)s: %(message)s",
@@ -69,14 +87,40 @@ def setup_logging() -> None:
     console.setFormatter(formatter)
     console.setLevel(logging.INFO)
 
+    log_queue: queue.SimpleQueue = queue.SimpleQueue()
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     root.handlers.clear()
-    root.addHandler(file_handler)
-    root.addHandler(console)
+    root.addHandler(logging.handlers.QueueHandler(log_queue))
 
-    # yt-dlp 每首歌會噴大量 debug，只留警告以上，否則 log 檔會被它淹掉。
+    _log_listener = logging.handlers.QueueListener(
+        log_queue, file_handler, console, respect_handler_level=True
+    )
+    _log_listener.start()
+    atexit.register(_log_listener.stop)
+
+    # yt-dlp 每首歌會噴大量 debug，httpx 則是每一次請求都記一行 INFO
+    # （封面、genre 查詢都會經過），兩者都會把真正有用的訊息淹掉。
     logging.getLogger("yt_dlp").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+def ensure_venv_interpreter() -> None:
+    """確保是用專案 venv 的直譯器在跑，否則就改用它重新執行自己。
+
+    直接雙擊 scripts/launch.py，或在終端機打 `python scripts/launch.py`，
+    都會用系統 Python 啟動 —— 那個環境不一定裝了本專案的相依套件，就算裝了
+    也是另一套版本。實際發生過：伺服器跑在系統 Python 上，與 start.bat 的
+    預期不符，除錯時非常難察覺。
+    """
+    venv_python = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
+    if not venv_python.exists():
+        return  # 還沒建 venv，交給 start.bat 處理
+    if Path(sys.executable).resolve() == venv_python.resolve():
+        return
+    print(f"[環境] 偵測到非 venv 直譯器，改用 {venv_python} 重新啟動…")
+    os.execv(str(venv_python), [str(venv_python), str(Path(__file__).resolve()), *sys.argv[1:]])
 
 
 def _die(message: str) -> None:
@@ -188,6 +232,7 @@ def main() -> None:
     os.chdir(PROJECT_ROOT)
     sys.path.insert(0, str(PROJECT_ROOT))
 
+    ensure_venv_interpreter()  # 可能就地 exec 換直譯器，之後的程式碼不保證接得下去
     setup_logging()
     ensure_ffmpeg()
     _warn_missing_contact()
