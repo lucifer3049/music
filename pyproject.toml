@@ -9,6 +9,7 @@ dependencies = [
     "mutagen>=1.47",
     "httpx>=0.28",
     "rapidfuzz>=3.10",
+    "zhconv>=1.4.3",
 ]
 
 [project.optional-dependencies]

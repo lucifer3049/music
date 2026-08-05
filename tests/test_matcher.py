@@ -2,6 +2,7 @@ import pytest
 
 from app.matching.matcher import (
     HIGH_CONFIDENCE,
+    han_variants,
     normalize_title,
     rank_candidates,
     score_candidate,
@@ -139,3 +140,88 @@ def test_rank_candidates_sorts_and_limits():
 
 def test_rank_candidates_empty_input():
     assert rank_candidates(_source(), []) == []
+
+
+# --- 簡繁折疊 -----------------------------------------------------------
+
+
+def test_normalize_title_does_not_convert_han():
+    """折疊只發生在比對時，不能動到輸出。
+
+    normalize_title() 的結果會經 split_title() 流進 pipeline.fallback_meta()、
+    最後寫成檔案標籤與資料夾名稱。若在這裡把繁體轉成簡體，使用者的收藏就會
+    被改寫成另一種字體。
+    """
+    assert normalize_title("人間驚鴻宴") == "人間驚鴻宴"
+
+
+def test_score_ignores_han_variant():
+    """同一首歌的簡繁寫法要當成吻合。
+
+    YouTube 標成「云翳之上」而 MusicBrainz 收錄「雲翳之上」是常態，
+    這種差異不該讓正確候選輸給不相干的歌。
+    """
+    source = _source(raw_title="云翳之上", artist="阿YueYue", track="云翳之上", duration=277)
+    meta = _meta(title="雲翳之上", artists=("阿YueYue",), album_artist="阿YueYue", duration=277)
+    assert score_candidate(source, meta) >= HIGH_CONFIDENCE
+
+
+def test_han_variants_dedupes_and_keeps_original_first():
+    assert han_variants("Bohemian Rhapsody") == ("Bohemian Rhapsody",)
+    variants = han_variants("云翳之上")
+    assert variants[0] == "云翳之上"
+    assert "雲翳之上" in variants
+    assert len(variants) == len(set(variants))
+
+
+# --- 硬否決 -------------------------------------------------------------
+
+
+def test_duration_gate_drops_far_candidate():
+    """時長差太多必定不是同一個錄音，不是扣分而是剔除。
+
+    實例：云翳之上（277 秒）在 MusicBrainz 查無結果，自由查詢撈回「云端之上」
+    （120 秒），字面相近讓它拿到最高分並被推成預設候選。
+    """
+    close = _meta(title="人間驚鴻宴", duration=209)
+    far = _meta(title="人間驚鴻宴", duration=120)
+    ranked = rank_candidates(_source(duration=207), [far, close])
+    assert [c.meta.duration for c in ranked] == [209]
+
+
+def test_duration_gate_keeps_release_version_differences():
+    """同一首歌在不同發行版之間差十幾二十秒是常態，不能當矛盾。
+
+    實測 Queen 的 Bohemian Rhapsody：MusicBrainz 前三筆是 338／325／130 秒，
+    界線若訂在 15 秒，整組正確候選會跟著 130 秒那筆一起被殺掉。
+    """
+    source = _source(raw_title="Queen - Bohemian Rhapsody", artist="Queen", duration=354)
+    metas = [
+        _meta(title="Bohemian Rhapsody", artists=("Queen",), album_artist="Queen", duration=d)
+        for d in (130, 338, 325)
+    ]
+    ranked = rank_candidates(source, metas)
+    assert sorted(c.meta.duration for c in ranked) == [325, 338]
+
+
+def test_duration_gate_keeps_candidate_without_duration():
+    # 缺值不是矛盾，不能當否決理由
+    ranked = rank_candidates(_source(duration=207), [_meta(duration=None)])
+    assert len(ranked) == 1
+
+
+def test_artist_gate_drops_wrong_artist():
+    """yt-dlp 給了結構化 artist 時，演出者完全不同的候選直接剔除。
+
+    Topic 頻道的 artist 由發行商上傳，可信度高；演出者對不上就是別首歌。
+    """
+    source = _source(artist="指尖笑", track="人間驚鴻宴")
+    ranked = rank_candidates(source, [_meta(artists=("李安健",), album_artist="李安健")])
+    assert ranked == []
+
+
+def test_artist_gate_needs_structured_artist():
+    """artist 缺值時只能從髒標題猜，猜出來的東西不夠格當否決依據。"""
+    source = _source(raw_title="人間驚鴻宴", artist=None, track=None)
+    ranked = rank_candidates(source, [_meta(artists=("李安健",), album_artist="李安健")])
+    assert len(ranked) == 1

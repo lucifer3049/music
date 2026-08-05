@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import datetime
 import subprocess
 from dataclasses import dataclass
 from enum import StrEnum
@@ -18,6 +19,12 @@ _YT_HOSTS = {"music.youtube.com", "www.youtube.com", "youtube.com", "m.youtube.c
 _SHORT_HOST = "youtu.be"
 # OLAK5uy_ 開頭是 YouTube 自動生成的專輯清單
 _ALBUM_LIST_PREFIX = "OLAK5uy_"
+# 錄音問世之前的年份不可能是發行年
+MIN_PLAUSIBLE_YEAR = 1900
+
+
+def _max_plausible_year() -> int:
+    return datetime.date.today().year + 1
 
 
 class UnsupportedUrlError(ValueError):
@@ -67,10 +74,22 @@ def _first_str(entry: dict, *keys: str) -> str | None:
     return None
 
 
+def _sane_year(value) -> int | None:
+    """yt-dlp 的 release_year 不保證是真的年份，荒謬的值一律當缺值。
+
+    實例：0y8NV9wAkwA（阿YueYue／云翳之上）回報 1060。這個值會原封流進
+    pipeline.fallback_meta()，最後寫成檔案標籤的年份。上界放寬到明年，
+    因為預告發行的單曲確實會標未來年份。
+    """
+    if not isinstance(value, int) or isinstance(value, bool):
+        return None
+    return value if MIN_PLAUSIBLE_YEAR <= value <= _max_plausible_year() else None
+
+
 def to_source_track(entry: dict) -> SourceTrack:
     """把 yt-dlp 的 info dict 轉成 SourceTrack。缺欄位一律 None，不猜。"""
     video_id = entry["id"]
-    year = entry.get("release_year")
+    year = _sane_year(entry.get("release_year"))
     return SourceTrack(
         video_id=video_id,
         url=f"https://music.youtube.com/watch?v={video_id}",

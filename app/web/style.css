@@ -527,6 +527,16 @@ button:disabled {
 .error:empty, .action-error:empty,
 .job-error:empty, .job-action-error:empty { display: none; }
 
+/* 探測中的提示：不是錯誤，用次要文字色，不套錯誤那條紅色左邊界 */
+.job-pending {
+  color: var(--sumi-3);
+  font-size: 0.86rem;
+  line-height: 1.65;
+  margin: 10px 0 0;
+}
+
+.job-pending:empty { display: none; }
+
 /* ── 窄螢幕 ───────────────────────────────────────────────────────── */
 
 @media (max-width: 560px) {

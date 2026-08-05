@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -29,7 +30,12 @@ import mutagen
 
 from app.config import LibraryRoots
 from app.jobs.store import JobStore, TrackStatus
-from app.matching.matcher import rank_candidates, split_title
+from app.matching.matcher import (
+    MIN_ACCEPTABLE_SCORE,
+    han_variants,
+    rank_candidates,
+    split_title,
+)
 from app.models import Candidate, SourceTrack, TrackMeta
 from app.sources import musicbrainz, youtube
 from app.storage.layout import build_paths
@@ -105,33 +111,69 @@ class Pipeline:
         self._keep_archive_copy = keep_archive_copy
 
     def submit(self, url: str) -> int:
-        """探測網址並為每首曲目產生候選標籤。回傳 job id。
+        """建立 job 並直接跑完探測與比對。回傳 job id。
 
-        probe 整批失敗（下架、私人、地區限制、網址不支援）時，不能無聲返回一個
+        這是「一路做完」的同步版本，給命令列與測試用。HTTP 端點走的是拆開的
+        create_job() + process_job()：探測動輒數秒到二十幾秒（實測同一支影片
+        2–22 秒都有），整段擋在請求裡會讓頁面看起來當掉。
+        """
+        job_id = self.create_job(url)
+        self.process_job(job_id, url)
+        return job_id
+
+    def create_job(self, url: str) -> int:
+        """只在資料庫建一筆 job，不碰網路。
+
+        JobStore 是 autocommit，這一筆一提交就對外可見，所以呼叫端可以立刻把
+        job id 交給前端訂閱 SSE，之後的曲目再由 process_job() 逐一補上
+        （見 app/api/routes.py 的 job_events()）。
+        """
+        return self.store.create_job(url)
+
+    def process_job(self, job_id: int, url: str) -> None:
+        """探測網址並為該 job 的每首曲目產生候選標籤。
+
+        probe 整批失敗（下架、私人、地區限制、網址不支援）時，不能無聲留下一個
         空 job —— 使用者需要知道原因才能決定要不要重試。失敗訊息記錄在
         jobs.error 欄位（見 JobStore.set_job_error），job.tracks 維持空陣列。
-        其餘非預期例外（真正的臭蟲）原樣冒出，不偽裝成「已記錄的失敗」。
+        其餘非預期例外（真正的臭蟲）原樣冒出，不偽裝成「已記錄的失敗」；在背景
+        執行時由呼叫端負責善後（見 app/api/routes.py 的 _on_job_done()）。
         """
-        job_id = self.store.create_job(url)
         logger.info("job %s 探測開始：%s", job_id, url)
+        # 探測與比對的耗時要分開記。兩段在使用者眼中都只是「畫面不動」，但成因
+        # 完全不同：探測是 yt-dlp 對 YouTube 的往返（實測同一支影片 2 秒到 22 秒
+        # 都有，取決於 YouTube 當下的節流），比對是 MusicBrainz 每秒 1 次的節流
+        # 乘上曲數。沒有這兩個數字就只能猜是哪一段慢。
+        started = time.monotonic()
         try:
             sources = self._probe_fn(url)
         except (youtube.ProbeError, youtube.UnsupportedUrlError) as exc:
-            logger.warning("job %s 探測失敗：%s", job_id, exc)
+            logger.warning(
+                "job %s 探測失敗（%.1f 秒）：%s", job_id, time.monotonic() - started, exc
+            )
             self.store.set_job_error(job_id, str(exc))
-            return job_id
+            return
 
         # 每首都要一次受節流的 MusicBrainz 查詢，所以曲數直接決定這段要等多久。
         # 使用者盯著「探測中」時最想知道的就是這個數字。
-        logger.info("job %s 探測到 %s 首，開始逐首比對 metadata", job_id, len(sources))
+        logger.info(
+            "job %s 探測到 %s 首（耗時 %.1f 秒），開始逐首比對 metadata",
+            job_id,
+            len(sources),
+            time.monotonic() - started,
+        )
+        matching_started = time.monotonic()
         with self._client_factory() as client:
             for index, source in enumerate(sources, start=1):
                 logger.info(
                     "job %s 比對 %s/%s：%s", job_id, index, len(sources), source.raw_title
                 )
                 self._process_source(job_id, source, client)
-        logger.info("job %s 比對完成，等待使用者確認", job_id)
-        return job_id
+        logger.info(
+            "job %s 比對完成（耗時 %.1f 秒），等待使用者確認",
+            job_id,
+            time.monotonic() - matching_started,
+        )
 
     def _process_source(self, job_id: int, source: SourceTrack, client) -> None:
         """一首曲目探測成功之後的後續處理：判重複／比對，失敗只記錄不外拋。
@@ -161,21 +203,56 @@ class Pipeline:
         query = musicbrainz.build_recording_query(
             track=source.track, artist=source.artist, raw_title=source.raw_title
         )
-        metas = self._search_fn(query, client=client)
+        metas = self._search_one_of(han_variants(query), client)
 
         # 欄位限定查得精準但也嚴格：歌名或演出者的寫法與 MusicBrainz 稍有出入
         # 就會一無所獲。查空時退回自由查詢，寧可給出幾個待人工判斷的候選，
         # 也不要讓使用者只剩「用 YouTube 原始標籤」一途。
+        #
+        # 這一段刻意不試簡繁變體，跟上面的欄位限定查詢不對稱：自由查詢撈回來的
+        # 東西本來就多半是「字面相近、實際無關」的別首歌，過不了 MIN_ACCEPTABLE_SCORE
+        # 就會被降級候選壓在下面。為這種結果多付一次 1.1 秒節流不划算 —— 整張
+        # 專輯逐首累加，每首每多一次查詢就是整批多等一輪。
         if not metas and query != source.raw_title:
-            metas = self._search_fn(source.raw_title, client=client)
+            metas = self._search(source.raw_title, client)
 
-        if metas:
-            candidates = rank_candidates(source, metas)
-        else:
-            # 降級：用 YouTube 自身資料，分數 0 代表未經 MusicBrainz 比對，
-            # 仍要提供給使用者確認，不能因為查無結果就擋住下載。
-            candidates = [Candidate(meta=fallback_meta(source), score=0.0)]
+        candidates = rank_candidates(source, metas) if metas else []
+
+        # 降級候選：YouTube 自身資料，分數 0 代表未經 MusicBrainz 比對。
+        # 沒有任何候選時它是唯一選項；有候選但最高分不到門檻時，它要排到最前面
+        # —— 網頁預設選中第一個候選，順序等於使用者按下確認後寫進檔案的標籤，
+        # 而低分候選多半是「字面相近、實際無關」的別首歌。低分候選仍留在後面，
+        # 這種時候真正該由誰決定的是使用者，不是門檻。
+        if not candidates or candidates[0].score < MIN_ACCEPTABLE_SCORE:
+            candidates.insert(0, Candidate(meta=fallback_meta(source), score=0.0))
         self.store.set_candidates(track_id, candidates)
+
+    def _search_one_of(self, queries: tuple[str, ...], client) -> list[TrackMeta]:
+        """逐個查詢直到有結果。用於簡繁變體退讓（見 matcher.han_variants）。
+
+        有結果就立刻停：每次查詢都要付 MusicBrainz 1.1 秒的節流成本，整張專輯
+        逐首累加，不能為了一個查得到的字體多打一次。
+        """
+        for query in queries:
+            metas = self._search(query, client)
+            if metas:
+                return metas
+        return []
+
+    def _search(self, query: str, client) -> list[TrackMeta]:
+        """查一次 MusicBrainz 並記錄耗時。
+
+        耗時要記錄，是因為「比對很慢」在使用者眼中跟「卡住不動」長得一模一樣。
+        MusicBrainz 匿名存取限每秒 1 次，節流等待就發生在 _search_fn 內部
+        （見 musicbrainz._throttle），所以這裡量到的秒數已經含等待時間 ——
+        比對慢到底是查詢次數太多、還是單一查詢回應慢，只有這行日誌分得出來。
+        """
+        started = time.monotonic()
+        metas = self._search_fn(query, client=client)
+        logger.info(
+            "MusicBrainz 查詢耗時 %.1f 秒、%s 筆：%s", time.monotonic() - started, len(metas), query
+        )
+        return metas
 
     def finalize(self, track_id: int) -> None:
         """下載、寫標籤、落檔。呼叫前必須已 confirm。"""

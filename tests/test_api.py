@@ -3,6 +3,7 @@ import gc
 import json
 import logging
 import threading
+import time
 
 import httpx
 import pytest
@@ -115,10 +116,12 @@ async def test_post_jobs_rejects_empty_list(client):
     assert (await client.post("/api/jobs", json={"urls": []})).status_code == 422
 
 
-async def test_get_job_returns_tracks_with_candidates(client):
+async def test_get_job_returns_tracks_with_candidates(client, app_and_pipeline):
+    _, pipeline = app_and_pipeline
     job_id = (await client.post(
         "/api/jobs", json={"urls": ["https://music.youtube.com/watch?v=v1"]}
     )).json()["job_ids"][0]
+    await _wait_for_matching(pipeline, job_id)
 
     body = (await client.get(f"/api/jobs/{job_id}")).json()
     assert body["id"] == job_id
@@ -143,6 +146,7 @@ async def test_confirm_track_triggers_finalize(client, app_and_pipeline):
     job_id = (await client.post(
         "/api/jobs", json={"urls": ["https://music.youtube.com/watch?v=v1"]}
     )).json()["job_ids"][0]
+    await _wait_for_matching(pipeline, job_id)
     track_id = pipeline.store.get_job(job_id).tracks[0].id
 
     response = await client.post(f"/api/tracks/{track_id}/confirm", json={"meta": META_PAYLOAD})
@@ -157,6 +161,7 @@ async def test_confirm_rejects_bad_meta(client, app_and_pipeline):
     job_id = (await client.post(
         "/api/jobs", json={"urls": ["https://music.youtube.com/watch?v=v1"]}
     )).json()["job_ids"][0]
+    await _wait_for_matching(pipeline, job_id)
     track_id = pipeline.store.get_job(job_id).tracks[0].id
     bad = {k: v for k, v in META_PAYLOAD.items() if k != "title"}
     assert (await client.post(
@@ -169,6 +174,7 @@ async def test_skip_track(client, app_and_pipeline):
     job_id = (await client.post(
         "/api/jobs", json={"urls": ["https://music.youtube.com/watch?v=v1"]}
     )).json()["job_ids"][0]
+    await _wait_for_matching(pipeline, job_id)
     track_id = pipeline.store.get_job(job_id).tracks[0].id
 
     assert (await client.post(f"/api/tracks/{track_id}/skip")).status_code == 200
@@ -195,6 +201,7 @@ async def test_confirm_rejects_already_done_track(client, app_and_pipeline):
     job_id = (await client.post(
         "/api/jobs", json={"urls": ["https://music.youtube.com/watch?v=v1"]}
     )).json()["job_ids"][0]
+    await _wait_for_matching(pipeline, job_id)
     track_id = pipeline.store.get_job(job_id).tracks[0].id
     await client.post(f"/api/tracks/{track_id}/confirm", json={"meta": META_PAYLOAD})
     await _wait_for(pipeline, track_id, TrackStatus.DONE)
@@ -220,6 +227,7 @@ async def test_confirm_rejects_track_already_downloading(tmp_path):
         job_id = (await c.post(
             "/api/jobs", json={"urls": ["https://music.youtube.com/watch?v=v1"]}
         )).json()["job_ids"][0]
+        await _wait_for_matching(pipeline, job_id)
         track_id = pipeline.store.get_job(job_id).tracks[0].id
 
         first = await c.post(f"/api/tracks/{track_id}/confirm", json={"meta": META_PAYLOAD})
@@ -241,6 +249,7 @@ async def test_skip_rejects_already_done_track(client, app_and_pipeline):
     job_id = (await client.post(
         "/api/jobs", json={"urls": ["https://music.youtube.com/watch?v=v1"]}
     )).json()["job_ids"][0]
+    await _wait_for_matching(pipeline, job_id)
     track_id = pipeline.store.get_job(job_id).tracks[0].id
     await client.post(f"/api/tracks/{track_id}/confirm", json={"meta": META_PAYLOAD})
     await _wait_for(pipeline, track_id, TrackStatus.DONE)
@@ -248,6 +257,102 @@ async def test_skip_rejects_already_done_track(client, app_and_pipeline):
     response = await client.post(f"/api/tracks/{track_id}/skip")
     assert response.status_code == 409
     assert TrackStatus.DONE.value in response.json()["detail"]
+
+
+# --- POST /api/jobs 不等探測（探測實測 2–22 秒，擋在請求裡會讓頁面像當掉）---
+
+
+async def test_post_jobs_returns_before_probing_finishes(tmp_path):
+    """送出後必須立刻拿到 job id，不能等到探測跑完。
+
+    前端靠回應裡的 job id 訂閱 SSE；回應被探測擋住的話，使用者看到的就是一個
+    毫無進度的畫面，一次貼多個網址時要等上好幾分鐘。
+    """
+    gate = threading.Event()
+
+    def gated_probe(url):
+        gate.wait(timeout=5)
+        return [_source()]
+
+    pipeline = _build_pipeline(tmp_path, probe_fn=gated_probe)
+    app = create_app(pipeline)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        response = await c.post(
+            "/api/jobs", json={"urls": ["https://music.youtube.com/watch?v=v1"]}
+        )
+        assert response.status_code == 200
+        job_id = response.json()["job_ids"][0]
+        # 探測還卡在 gate 上，job 已經存在且可訂閱，只是還沒有曲目
+        assert pipeline.store.get_job(job_id) is not None
+        assert pipeline.store.get_job(job_id).tracks == []
+
+        gate.set()
+        await _wait_for_matching(pipeline, job_id)
+        assert len(pipeline.store.get_job(job_id).tracks) == 1
+    pipeline.store.close()
+
+
+async def test_post_jobs_processes_one_job_at_a_time(tmp_path):
+    """多個網址要排隊跑，不能並發。
+
+    YouTube 對並發探測加重節流，MusicBrainz 匿名存取更是硬性每秒 1 次；
+    並發只會讓每個 job 都更慢（見 app/api/routes.py 的 submit_lock）。
+    """
+    lock = threading.Lock()
+    state = {"running": 0, "peak": 0}
+
+    def counting_probe(url):
+        with lock:
+            state["running"] += 1
+            state["peak"] = max(state["peak"], state["running"])
+        time.sleep(0.05)
+        with lock:
+            state["running"] -= 1
+        return [_source()]
+
+    pipeline = _build_pipeline(tmp_path, probe_fn=counting_probe)
+    app = create_app(pipeline)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        job_ids = (await c.post("/api/jobs", json={"urls": [
+            "https://music.youtube.com/watch?v=v1",
+            "https://music.youtube.com/watch?v=v2",
+            "https://music.youtube.com/watch?v=v3",
+        ]})).json()["job_ids"]
+        for job_id in job_ids:
+            await _wait_for_matching(pipeline, job_id)
+    assert state["peak"] == 1
+    pipeline.store.close()
+
+
+async def test_post_jobs_records_unexpected_background_error_on_job(tmp_path, caplog):
+    """背景探測撞上程式臭蟲時，錯誤要寫回 job，不能讓畫面永遠空白。
+
+    Pipeline.process_job() 刻意讓非預期例外原樣冒出。同步呼叫時那是 HTTP 500，
+    使用者看得到；改成背景執行後沒有人接，job 會停在既沒有曲目也沒有錯誤的
+    狀態，SSE 也不會結束。
+    """
+
+    def buggy_probe(url):
+        raise RuntimeError("程式自己的臭蟲")
+
+    pipeline = _build_pipeline(tmp_path, probe_fn=buggy_probe)
+    app = create_app(pipeline)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        with caplog.at_level(logging.ERROR):
+            job_id = (await c.post(
+                "/api/jobs", json={"urls": ["https://music.youtube.com/watch?v=v1"]}
+            )).json()["job_ids"][0]
+            await _wait_for_matching(pipeline, job_id)
+
+    job = pipeline.store.get_job(job_id)
+    assert job.tracks == []
+    assert "未預期的內部錯誤" in job.error
+    assert "程式自己的臭蟲" in job.error
+    assert any("程式自己的臭蟲" in r.getMessage() or r.exc_info for r in caplog.records)
+    pipeline.store.close()
 
 
 # --- job 層級錯誤（Task 10 之後 probe 整批失敗記錄在 jobs.error，tracks 維持空陣列）---
@@ -264,6 +369,7 @@ async def test_get_job_surfaces_job_level_error(tmp_path):
         job_id = (await c.post(
             "/api/jobs", json={"urls": ["https://music.youtube.com/watch?v=bad"]}
         )).json()["job_ids"][0]
+        await _wait_for_matching(pipeline, job_id)
         body = (await c.get(f"/api/jobs/{job_id}")).json()
 
     assert body["tracks"] == []
@@ -414,6 +520,7 @@ async def test_events_stream_reports_terminal_status(client, app_and_pipeline):
     job_id = (await client.post(
         "/api/jobs", json={"urls": ["https://music.youtube.com/watch?v=v1"]}
     )).json()["job_ids"][0]
+    await _wait_for_matching(pipeline, job_id)
     track_id = pipeline.store.get_job(job_id).tracks[0].id
     await client.post(f"/api/tracks/{track_id}/confirm", json={"meta": META_PAYLOAD})
 
@@ -462,6 +569,7 @@ async def test_confirm_keeps_strong_reference_until_finalize_completes(tmp_path)
         job_id = (await c.post(
             "/api/jobs", json={"urls": ["https://music.youtube.com/watch?v=v1"]}
         )).json()["job_ids"][0]
+        await _wait_for_matching(pipeline, job_id)
         track_id = pipeline.store.get_job(job_id).tracks[0].id
 
         response = await c.post(f"/api/tracks/{track_id}/confirm", json={"meta": META_PAYLOAD})
@@ -495,6 +603,7 @@ async def test_confirm_background_exception_is_logged(tmp_path, caplog):
         job_id = (await c.post(
             "/api/jobs", json={"urls": ["https://music.youtube.com/watch?v=v1"]}
         )).json()["job_ids"][0]
+        await _wait_for_matching(pipeline, job_id)
         track_id = pipeline.store.get_job(job_id).tracks[0].id
 
         with caplog.at_level(logging.ERROR):
@@ -555,6 +664,7 @@ async def test_delete_job_rejects_track_in_flight(tmp_path):
         job_id = (await c.post(
             "/api/jobs", json={"urls": ["https://music.youtube.com/watch?v=v1"]}
         )).json()["job_ids"][0]
+        await _wait_for_matching(pipeline, job_id)
         track_id = pipeline.store.get_job(job_id).tracks[0].id
 
         confirm_resp = await c.post(f"/api/tracks/{track_id}/confirm", json={"meta": META_PAYLOAD})
@@ -580,6 +690,7 @@ async def test_delete_job_allowed_once_track_reaches_terminal_status(client, app
     job_id = (await client.post(
         "/api/jobs", json={"urls": ["https://music.youtube.com/watch?v=v1"]}
     )).json()["job_ids"][0]
+    await _wait_for_matching(pipeline, job_id)
     track_id = pipeline.store.get_job(job_id).tracks[0].id
     await client.post(f"/api/tracks/{track_id}/confirm", json={"meta": META_PAYLOAD})
     await _wait_for(pipeline, track_id, TrackStatus.DONE)
@@ -594,6 +705,7 @@ async def test_clear_finished_jobs_returns_deleted_count(client, app_and_pipelin
     job_id = (await client.post(
         "/api/jobs", json={"urls": ["https://music.youtube.com/watch?v=v1"]}
     )).json()["job_ids"][0]
+    await _wait_for_matching(pipeline, job_id)
     track_id = pipeline.store.get_job(job_id).tracks[0].id
     await client.post(f"/api/tracks/{track_id}/confirm", json={"meta": META_PAYLOAD})
     await _wait_for(pipeline, track_id, TrackStatus.DONE)
@@ -611,6 +723,7 @@ async def test_clear_finished_jobs_leaves_populating_job_alone(client, app_and_p
     job_id = (await client.post(
         "/api/jobs", json={"urls": ["https://music.youtube.com/watch?v=v1"]}
     )).json()["job_ids"][0]
+    await _wait_for_matching(pipeline, job_id)
     track_id = pipeline.store.get_job(job_id).tracks[0].id
     # 手動把唯一的 track 撥回非終態，模擬「job 還在跑」，不牽動 delete_finished_jobs
     # 判斷 job 是否完成的邏輯本身（那部分已經在 test_store.py 覆蓋過）。
@@ -620,6 +733,28 @@ async def test_clear_finished_jobs_leaves_populating_job_alone(client, app_and_p
     assert response.status_code == 200
     assert response.json() == {"deleted": 0}
     assert pipeline.store.get_job(job_id) is not None
+
+
+async def _wait_for_matching(pipeline, job_id, timeout=5.0):
+    """等 POST /api/jobs 排出去的背景探測／比對跑完。
+
+    這個等待是端點改成非同步之後才需要的：POST 現在只建 job 就回應，曲目由
+    背景工作補上（見 app/api/routes.py 的 submit_jobs()）。
+
+    「曲目已出現」還不夠：曲目是先以 PENDING 建立、再轉 MATCHING、比對完才到
+    AWAITING_CONFIRM，太早返回會讓後續的 confirm 撞上 409。job 層級探測失敗的
+    情況則永遠不會有曲目，改看 error 欄位，否則會白等到逾時。
+    """
+    unsettled = {TrackStatus.PENDING, TrackStatus.MATCHING}
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        job = pipeline.store.get_job(job_id)
+        if job is not None and job.error is not None:
+            return
+        if job is not None and job.tracks and not any(t.status in unsettled for t in job.tracks):
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"job {job_id} 的背景比對未在時限內完成")
 
 
 async def _wait_for(pipeline, track_id, status, timeout=5.0):

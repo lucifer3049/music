@@ -71,6 +71,24 @@ def test_to_source_track_joins_artists_list():
     assert st.artist == "A, B"
 
 
+@pytest.mark.parametrize("year", [1060, 0, -1, 3500])
+def test_to_source_track_drops_implausible_year(year):
+    """yt-dlp 的 release_year 不保證是真的年份。
+
+    實例：0y8NV9wAkwA（阿YueYue／云翳之上）回報 release_year=1060，會原封
+    流進 pipeline.fallback_meta()、最後寫成檔案標籤的年份。荒謬的值一律當
+    缺值，符合本函式「缺欄位一律 None，不猜」的既有立場。
+    """
+    st = to_source_track({"id": "x", "title": "t", "release_year": year})
+    assert st.release_year is None
+
+
+@pytest.mark.parametrize("year", [1900, 2026])
+def test_to_source_track_keeps_plausible_year(year):
+    st = to_source_track({"id": "x", "title": "t", "release_year": year})
+    assert st.release_year == year
+
+
 class _FakeYDL:
     """模擬 yt_dlp.YoutubeDL 的 context manager 介面。"""
 

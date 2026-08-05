@@ -25,6 +25,10 @@ def build() -> FastAPI:
     # 不收斂會讓那些曲目永遠卡住（SSE 迴圈不結束、confirm/skip 永遠 409）。
     # 見 JobStore.recover_interrupted_tracks() 的說明。
     store.recover_interrupted_tracks("伺服器重啟時中斷，可重新確認")
+    # 上次行程也可能死在「探測到一半、還沒建出任何曲目」的空窗期：那種 job
+    # 一筆 track 都沒有，上面那行掃不到它。見
+    # JobStore.recover_interrupted_jobs() 的說明。
+    store.recover_interrupted_jobs("伺服器重啟時中斷，可重新送出這個網址")
     # 正式環境的預設值在這裡決定：冷存副本預設關閉（見 config.keep_archive_copy
     # 的說明）。Pipeline 建構子本身仍預設 True，維持既有測試的原本語意。
     pipeline = Pipeline(

@@ -109,6 +109,13 @@ def create_app(pipeline: Pipeline) -> FastAPI:
     background_tasks: set[asyncio.Task] = set()
     app.state.background_tasks = background_tasks
 
+    # 探測與比對一次只跑一個 job。這不是為了保護事件迴圈（那是 to_thread 的
+    # 工作），而是為了維持送出多個網址時對外部服務的壓力跟以前一樣：YouTube
+    # 對並發探測會加重節流（實測單支影片探測 2–22 秒，本來就是被節流左右的），
+    # MusicBrainz 匿名存取更是硬性每秒 1 次。並發只會讓每個 job 都變慢。
+    submit_lock = asyncio.Lock()
+    app.state.submit_lock = submit_lock
+
     def _on_finalize_done(task: asyncio.Task) -> None:
         background_tasks.discard(task)
         if task.cancelled():
@@ -121,12 +128,40 @@ def create_app(pipeline: Pipeline) -> FastAPI:
             # 卻查無原因。
             logger.error("背景下載工作發生未預期例外", exc_info=exc)
 
+    async def _run_job(job_id: int, url: str) -> None:
+        # Pipeline.process_job() 會打網路（yt-dlp 探測 + MusicBrainz 查詢），
+        # 丟到 thread 避免卡住事件迴圈。
+        async with submit_lock:
+            await asyncio.to_thread(pipeline.process_job, job_id, url)
+
+    def _on_job_done(task: asyncio.Task, job_id: int) -> None:
+        background_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        # Pipeline.process_job() 刻意讓非預期例外原樣冒出，不偽裝成「已記錄的
+        # 失敗」。同步呼叫時那會變成 HTTP 500，使用者至少看得到；改成背景執行
+        # 之後沒有人接，job 會永遠停在沒有曲目也沒有錯誤的空白狀態，SSE 也不會
+        # 結束（見 job_events() 的結束條件）。所以這裡要留完整 traceback，並把
+        # 錯誤寫回 job，讓畫面上看得到。措辭比照 Pipeline.finalize() 對程式臭蟲
+        # 的處理，跟「探測失敗」這種預期內的失敗區分開。
+        logger.error("job %s 探測或比對發生未預期的內部錯誤", job_id, exc_info=exc)
+        pipeline.store.set_job_error(job_id, f"未預期的內部錯誤：{exc}")
+
     @app.post("/api/jobs")
     async def submit_jobs(request: SubmitRequest) -> dict:
-        # submit 會打網路，丟到 thread 避免卡住事件迴圈
-        job_ids = [
-            await asyncio.to_thread(pipeline.submit, url) for url in request.urls
-        ]
+        # 只建 job（純資料庫寫入）就立刻回應，探測與比對丟到背景。前端拿到
+        # job id 後靠 SSE 看曲目逐一浮出來，不必盯著一個沒有任何進度的請求
+        # 等上好幾分鐘。
+        job_ids = []
+        for url in request.urls:
+            job_id = pipeline.create_job(url)
+            job_ids.append(job_id)
+            task = asyncio.create_task(_run_job(job_id, url))
+            background_tasks.add(task)
+            task.add_done_callback(lambda t, jid=job_id: _on_job_done(t, jid))
         return {"job_ids": job_ids}
 
     @app.get("/api/jobs")

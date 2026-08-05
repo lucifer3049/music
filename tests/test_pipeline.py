@@ -692,16 +692,47 @@ def test_match_uses_field_qualified_query(tmp_path):
 
 
 def test_match_falls_back_to_free_text_when_qualified_query_finds_nothing(tmp_path):
-    """欄位限定查得準但也嚴格；查空時要再試一次自由查詢，別直接放棄。"""
-    pipe = _query_capturing_pipeline(tmp_path, [[], [_meta()]])
+    """欄位限定查得準但也嚴格；查空時要再試一次自由查詢，別直接放棄。
+
+    退讓順序：欄位限定（原字體 → 另一種字體）→ 自由查詢（同樣兩種字體）。
+    """
+    pipe = _query_capturing_pipeline(tmp_path, [[], [], [_meta()]])
     job_id = pipe.submit("https://music.youtube.com/watch?v=v1")
 
-    assert len(pipe.queries) == 2
+    assert len(pipe.queries) == 3
     assert pipe.queries[0].startswith("recording:")
-    assert pipe.queries[1] == _source().raw_title
+    assert pipe.queries[1].startswith("recording:")
+    assert pipe.queries[2] == _source().raw_title
 
     track = pipe.store.get_job(job_id).tracks[0]
     assert track.candidates[0].score > 0, "退回查詢找到的結果不該被當成未配對"
+    pipe.store.close()
+
+
+def test_match_never_exceeds_three_queries_per_track(tmp_path):
+    """一首曲目最多三次查詢，這是使用者要等多久的直接上限。
+
+    MusicBrainz 匿名存取限每秒 1 次，每多一次查詢就是整批多等一輪 ——
+    39 首的專輯全部查空時，三次是 129 秒，四次就是 172 秒。自由查詢那段
+    刻意不試簡繁變體，就是為了守住這個上限（見 Pipeline._match_one）。
+    """
+    pipe = _query_capturing_pipeline(tmp_path, [[], [], []])
+    pipe.submit("https://music.youtube.com/watch?v=v1")
+    assert len(pipe.queries) == 3
+    pipe.store.close()
+
+
+def test_match_retries_qualified_query_in_the_other_han_script(tmp_path):
+    """簡繁寫法不同不該讓歌整個查不到。
+
+    實例：YouTube 標成「云翳之上」，MusicBrainz 收錄「雲翳之上」，
+    原字體的欄位限定查詢一無所獲。
+    """
+    pipe = _query_capturing_pipeline(tmp_path, [[], [_meta()]])
+    pipe.submit("https://music.youtube.com/watch?v=v1")
+
+    assert len(pipe.queries) == 2
+    assert pipe.queries[1] == 'recording:"人间惊鸿宴" AND artist:"指尖笑"'
     pipe.store.close()
 
 
@@ -710,4 +741,60 @@ def test_match_does_not_retry_when_qualified_query_succeeds(tmp_path):
     pipe = _query_capturing_pipeline(tmp_path, [[_meta()]])
     pipe.submit("https://music.youtube.com/watch?v=v1")
     assert len(pipe.queries) == 1
+    pipe.store.close()
+
+
+def test_match_does_not_multiply_queries_for_ascii_titles(tmp_path):
+    """純 ASCII 曲目沒有簡繁變體可試，不能因此多付一次節流成本。"""
+    ascii_source = SourceTrack(
+        video_id="v1",
+        url="https://music.youtube.com/watch?v=v1",
+        raw_title="Queen - Bohemian Rhapsody",
+        duration=207,
+        artist="Queen",
+        track="Bohemian Rhapsody",
+        album=None,
+        release_year=None,
+    )
+    pipe = _query_capturing_pipeline(tmp_path, [[], []])
+    pipe._probe_fn = lambda url: [ascii_source]
+    pipe.submit("https://music.youtube.com/watch?v=v1")
+
+    assert pipe.queries == [
+        'recording:"Bohemian Rhapsody" AND artist:"Queen"',
+        "Queen - Bohemian Rhapsody",
+    ]
+    pipe.store.close()
+
+
+def test_weak_candidates_are_outranked_by_youtube_meta(tmp_path):
+    """比對不出可信結果時，預設候選必須是 YouTube 自己的資料。
+
+    實例：云翳之上／阿YueYue 在 MusicBrainz 查無此曲，自由查詢撈回
+    「云端之上／李安健」這種字面相近卻毫不相干的歌。網頁預設選中第一個
+    候選，所以順序直接決定使用者按下確認後寫進檔案的標籤。
+    弱候選仍保留在後面，讓使用者能自行判斷。
+    """
+    # 演出者吻合、時長缺值（兩道硬否決都攔不住），只有歌名對不上 —— 這種
+    # 「看起來像、其實不是」的候選只能靠分數地板擋。
+    pipe = _query_capturing_pipeline(
+        tmp_path, [[_meta(title="人間夜行", duration=None)]]
+    )
+    job_id = pipe.submit("https://music.youtube.com/watch?v=v1")
+
+    track = pipe.store.get_job(job_id).tracks[0]
+    assert track.candidates[0].score == 0.0
+    assert track.candidates[0].meta.title == "人間驚鴻宴"
+    assert len(track.candidates) == 2, "弱候選要保留，不是丟掉"
+    pipe.store.close()
+
+
+def test_strong_candidate_stays_first(tmp_path):
+    """比對得出可信結果時，不能被 YouTube 降級資料擠掉。"""
+    pipe = _query_capturing_pipeline(tmp_path, [[_meta()]])
+    job_id = pipe.submit("https://music.youtube.com/watch?v=v1")
+
+    track = pipe.store.get_job(job_id).tracks[0]
+    assert track.candidates[0].score >= 0.9
+    assert track.candidates[0].meta.year == 2026
     pipe.store.close()

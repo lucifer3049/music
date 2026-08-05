@@ -59,7 +59,7 @@ submitBtn.addEventListener("click", async () => {
   if (urls.length === 0) return;
 
   submitBtn.disabled = true;
-  submitStatus.textContent = "探測中，請稍候…";
+  submitStatus.textContent = "送出中…";
   try {
     const response = await fetch("/api/jobs", {
       method: "POST",
@@ -68,6 +68,9 @@ submitBtn.addEventListener("click", async () => {
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const { job_ids: jobIds } = await response.json();
+    // 只講「建好了」，不講進度。這行字寫上去就不會再更新，探測進度要看下面
+    // 每張任務卡自己的狀態——這裡若寫「探測中…」，探測早就完成了它還掛在那裡，
+    // 使用者會以為卡住了。
     submitStatus.textContent = `已建立 ${jobIds.length} 個任務`;
     urlsEl.value = "";
     jobIds.forEach(watchJob);
@@ -113,6 +116,13 @@ function renderJob(job) {
   // 就整批失敗，tracks 會是空陣列。不把這個欄位顯示出來的話，使用者看到
   // 的就只是一個永遠不會冒出曲目的空白任務，完全不知道發生了什麼事。
   section.querySelector(".job-error").textContent = job.error || "";
+
+  // 送出後 POST 立刻回應，探測與比對在後端背景跑（見 app/api/routes.py 的
+  // submit_jobs()），所以 job 會有一段時間既沒有曲目也沒有錯誤。不放這行字
+  // 的話那段時間就是一張全空的卡片，跟「壞掉了」長得一模一樣——而探測實測
+  // 要 2 到 22 秒，並不短。
+  section.querySelector(".job-pending").textContent =
+    job.tracks.length === 0 && !job.error ? "探測中…" : "";
 
   const container = section.querySelector(".tracks");
   // 後端每秒不做內容比對地整包推 SSE payload，renderJob() 平常就整包

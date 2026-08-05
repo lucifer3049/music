@@ -184,6 +184,29 @@ def test_recover_interrupted_tracks_marks_stuck_statuses_failed(store):
         assert row.status == status
 
 
+def test_recover_interrupted_jobs_marks_probe_that_never_finished(store):
+    """探測跑到一半 process 就死掉的 job 必須在啟動時收斂。
+
+    實例（jobs.db 的 job 59）：探測開始後行程被關掉，那筆 job 永遠是「沒有
+    任何曲目、也沒有錯誤」。SSE 的結束條件（見 app/api/routes.py 的
+    job_events()）刻意不把空 tracks 當結束——因為 submit 還在跑時也長這樣——
+    所以這種 job 的串流永遠不會結束，畫面上就是一張永遠在轉的空白卡片。
+    recover_interrupted_tracks() 只掃 tracks，掃不到連一筆 track 都沒有的 job。
+    """
+    interrupted = store.create_job("被中斷的網址")
+    populated = store.create_job("正常的網址")
+    store.add_track(populated, _source("v1"))
+    already_failed = store.create_job("下架的網址")
+    store.set_job_error(already_failed, "這部影片已下架")
+
+    changed = store.recover_interrupted_jobs("伺服器重啟時中斷，可重新送出")
+    assert changed == 1
+
+    assert store.get_job(interrupted).error == "伺服器重啟時中斷，可重新送出"
+    assert store.get_job(populated).error is None
+    assert store.get_job(already_failed).error == "這部影片已下架"
+
+
 def test_schema_is_idempotent(tmp_path):
     s = JobStore(tmp_path / "jobs.db")
     s.init_schema()

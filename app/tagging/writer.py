@@ -62,20 +62,39 @@ def _make_picture(cover: bytes) -> Picture:
     return picture
 
 
+def _assign(audio, key: str, value) -> None:
+    """有值就寫，沒值就把既有的清掉。
+
+    清掉這一步是必要的，不是保險：yt-dlp 抓下來的檔案帶著 YouTube 自己的標籤，
+    只寫不刪的話，我們沒有值的欄位就會留著來源檔的殘留值。實例——阿YueYue 的
+    云翳之上 MusicBrainz 查無此曲、YouTube 的 release_year 又是荒謬的 1060 被
+    消毒成 None，結果檔案裡留著 YouTube 上傳年份 2026，看起來像是查證過的年份。
+    TrackMeta 表達的是這個檔案標籤的完整意圖，None 代表「不該有值」。
+    """
+    if value is None:
+        audio.pop(key, None)
+    else:
+        audio[key] = value
+
+
 def _write_m4a(path: Path, meta: TrackMeta, cover: bytes | None) -> None:
     audio = MP4(path)
     audio["\xa9nam"] = [meta.title]
     audio["\xa9ART"] = [meta.display_artists]
     audio["aART"] = [meta.album_artist]
     audio["\xa9alb"] = [meta.album]
-    if meta.year is not None:
-        audio["\xa9day"] = [str(meta.year)]
-    if meta.track_no is not None:
-        audio["trkn"] = [(meta.track_no, meta.track_total or 0)]
-    if meta.genre:
-        audio["\xa9gen"] = [meta.genre]
-    if cover:
-        audio["covr"] = [MP4Cover(cover, imageformat=MP4Cover.FORMAT_JPEG)]
+    _assign(audio, "\xa9day", [str(meta.year)] if meta.year is not None else None)
+    _assign(
+        audio,
+        "trkn",
+        [(meta.track_no, meta.track_total or 0)] if meta.track_no is not None else None,
+    )
+    _assign(audio, "\xa9gen", [meta.genre] if meta.genre else None)
+    _assign(
+        audio,
+        "covr",
+        [MP4Cover(cover, imageformat=MP4Cover.FORMAT_JPEG)] if cover else None,
+    )
     audio.save()
 
 
@@ -86,17 +105,21 @@ def _write_opus(path: Path, meta: TrackMeta, cover: bytes | None) -> None:
     audio["ARTIST"] = list(meta.artists)
     audio["ALBUMARTIST"] = [meta.album_artist]
     audio["ALBUM"] = [meta.album]
-    if meta.year is not None:
-        audio["DATE"] = [str(meta.year)]
-    if meta.track_no is not None:
-        audio["TRACKNUMBER"] = [str(meta.track_no)]
-    if meta.track_total is not None:
-        audio["TOTALTRACKS"] = [str(meta.track_total)]
-    if meta.genre:
-        audio["GENRE"] = [meta.genre]
-    if cover:
-        encoded = base64.b64encode(_make_picture(cover).write()).decode("ascii")
-        audio["METADATA_BLOCK_PICTURE"] = [encoded]
+    _assign(audio, "DATE", [str(meta.year)] if meta.year is not None else None)
+    _assign(
+        audio, "TRACKNUMBER", [str(meta.track_no)] if meta.track_no is not None else None
+    )
+    _assign(
+        audio,
+        "TOTALTRACKS",
+        [str(meta.track_total)] if meta.track_total is not None else None,
+    )
+    _assign(audio, "GENRE", [meta.genre] if meta.genre else None)
+    _assign(
+        audio,
+        "METADATA_BLOCK_PICTURE",
+        [base64.b64encode(_make_picture(cover).write()).decode("ascii")] if cover else None,
+    )
     audio.save()
 
 

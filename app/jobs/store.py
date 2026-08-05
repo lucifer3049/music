@@ -195,6 +195,32 @@ class JobStore:
             )
             return cursor.rowcount
 
+    def recover_interrupted_jobs(self, message: str) -> int:
+        """啟動時把上次行程留下的「探測到一半」job 收斂成帶錯誤訊息。
+
+        `recover_interrupted_tracks()` 只掃 tracks，掃不到這種 job：探測是在
+        第一筆 `add_track()` 之前，process 若在那段期間死掉，資料庫裡留下的是
+        一筆「沒有任何曲目、也沒有錯誤」的 job，底下一筆 track 都沒有。
+
+        這種 job 是死的，但畫面上看起來跟「正在探測」一模一樣：SSE 的結束條件
+        （見 `app/api/routes.py` 的 `job_events()`）刻意不把空 tracks 當結束，
+        因為探測還在跑時也是空的。結果就是一張永遠不會有下文的卡片，使用者只會
+        以為它還在找。
+
+        啟動時做這件事是安全的：新行程剛起來，不可能有任何探測正在進行中，
+        所以「沒有曲目又沒有錯誤」在這個時間點只可能是上次留下的殘骸。
+        """
+        with self._write_lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE jobs SET error = ?
+                WHERE error IS NULL
+                  AND id NOT IN (SELECT DISTINCT job_id FROM tracks)
+                """,
+                (message,),
+            )
+            return cursor.rowcount
+
     def set_job_error(self, job_id: int, message: str) -> None:
         """記錄 job 層級失敗（探測整批拿不到任何曲目時）。
 
